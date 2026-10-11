@@ -65,3 +65,6 @@ curvine-tests/regression_result
 plans/
 .mcp.json
 opencode.jsonc
+
+# Local environment information and temporary files
+/tmp/
