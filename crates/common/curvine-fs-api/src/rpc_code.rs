@@ -50,7 +50,7 @@ pub enum RpcCode {
     Free = 26,
     ListOptions = 27,
     GetCvMetadataSnapshotPage = 28,
-    GetCvMetadataDeltaPage = 29,
+    // 29: retired (GetCvMetadataDeltaPage), do not reuse.
 
     // manager interface.
     Mount = 30,
@@ -73,6 +73,7 @@ pub enum RpcCode {
     ListTransfers = 52,
     ListTransferTenants = 53,
     RetryTransfer = 54,
+    GetFileBlockDetails = 55,
     WorkerHeartbeat = 40,
     WorkerBlockReport = 41,
 
@@ -81,6 +82,10 @@ pub enum RpcCode {
     RequestReplacementWorker = 44,
     ReportUnderReplicatedBlocks = 45,
 
+    PrepareReplication = 56,
+    ReconcileReplication = 57,
+    SubmitFencedReplication = 58,
+
     MetricsReport = 60,
 
     // block interface.
@@ -88,6 +93,7 @@ pub enum RpcCode {
     ReadBlock = 81,
     WriteBlocksBatch = 82,
     WriteCommitsBatch = 83,
+    WriteReplicationBlock = 84,
 }
 
 impl fmt::Display for RpcCode {

@@ -186,6 +186,7 @@ fn main() -> CommonResult<()> {
         let result = match args.command {
             Some(Commands::Bench(cmd)) => cmd.execute(curvine_fs, conf_source.clone()).await,
             Some(Commands::Fs(cmd)) => cmd.execute(curvine_fs).await,
+            Some(Commands::Fsck(cmd)) => cmd.execute(fs_client).await,
             Some(Commands::Report(cmd)) => cmd.execute(curvine_fs).await,
             Some(Commands::Load(cmd)) => match transfer_client.clone() {
                 Some(transfer_client) => cmd.execute_transfer(curvine_fs.clone(), transfer_client).await,
@@ -252,6 +253,50 @@ mod tests {
             .expect("export command should parse");
 
         assert!(matches!(args.command, Some(Commands::Export(_))));
+    }
+
+    #[test]
+    fn fsck_flags_are_available() {
+        let args = CurvineArgs::try_parse_from([
+            "curvine",
+            "fsck",
+            "/data",
+            "--detail",
+            "--list-page-size",
+            "512",
+        ])
+        .expect("fsck command should parse");
+
+        let Some(Commands::Fsck(command)) = args.command else {
+            panic!("expected fsck command");
+        };
+        assert_eq!(command.path, "/data");
+        assert!(command.detail);
+        assert_eq!(command.list_page_size, 512);
+    }
+
+    #[test]
+    fn fsck_list_page_size_defaults_and_enforces_bounds() {
+        let args = CurvineArgs::try_parse_from(["curvine", "fsck", "/data"])
+            .expect("default fsck command should parse");
+        let Some(Commands::Fsck(command)) = args.command else {
+            panic!("expected fsck command");
+        };
+        assert_eq!(command.list_page_size, 256);
+
+        for value in ["0", "4097", "-1", "1.5", "abc"] {
+            assert!(
+                CurvineArgs::try_parse_from([
+                    "curvine",
+                    "fsck",
+                    "/data",
+                    "--list-page-size",
+                    value,
+                ])
+                .is_err(),
+                "accepted {value}"
+            );
+        }
     }
 
     #[test]

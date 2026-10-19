@@ -27,8 +27,8 @@ use curvine_fs_api::RpcCode;
 use curvine_model::ProtoUtils;
 use curvine_model::{
     CompatibilityMode, CompatibilityPolicy, CompatibilityVerdict, CreateFileOpts, DeleteBlockCmd,
-    DeleteResult, FileBlocks, FileStatus, FilesystemInfo, FreeResult, HeartbeatStatus, ListOptions,
-    OpenFlags, RenameFlags, WorkerCommand, WorkerInfo,
+    DeleteResult, FileBlockDetails, FileBlocks, FileStatus, FilesystemInfo, FreeResult,
+    HeartbeatStatus, ListOptions, OpenFlags, RenameFlags, WorkerCommand, WorkerInfo,
 };
 use curvine_net::net::ConnState;
 use curvine_proto::*;
@@ -475,6 +475,21 @@ impl MasterHandler {
         fs.get_block_locations(path)
     }
 
+    pub fn get_file_block_details(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let req: GetFileBlockDetailsRequest = ctx.parse_header()?;
+        ctx.set_audit(Some(req.path.to_string()), None);
+
+        let details = Self::process_get_file_block_details(self.fs.clone(), req.path)?;
+        ctx.response(ProtoUtils::file_block_details_to_pb(details))
+    }
+
+    fn process_get_file_block_details(
+        fs: MasterFilesystem,
+        path: String,
+    ) -> FsResult<FileBlockDetails> {
+        fs.get_file_block_details(path)
+    }
+
     async fn run_master_rpc_task<T, F>(executor: Arc<GroupExecutor>, task: F) -> FsResult<T>
     where
         T: Send + 'static,
@@ -489,7 +504,7 @@ impl MasterHandler {
         rx.await?
     }
 
-    async fn async_get_filesystem_info(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+    pub fn get_filesystem_info(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let req: GetFilesystemInfoRequest = ctx.parse_header()?;
         // GetFilesystemInfo backs statfs and is called frequently. Only
         // evaluate the compatibility policy when the result can actually be
@@ -500,21 +515,26 @@ impl MasterHandler {
             .compatibility_policy
             .should_evaluate(req.component_info.is_some())
         {
+            let verdict = self
+                .compatibility_policy
+                .check_client(req.component_info.as_ref());
+            self.metrics.record_client_compat(
+                self.client_ip(),
+                req.component_info
+                    .as_ref()
+                    .map(|info| info.release_version.as_deref().unwrap_or_default()),
+                Self::verdict_label(&verdict),
+            );
             Self::check_peer_compatibility(
                 "client",
                 &format!("client:{}", self.client_ip()),
                 &self.compat_warned,
                 self.compatibility_policy.mode,
-                self.compatibility_policy
-                    .check_client(req.component_info.as_ref()),
+                verdict,
                 self.metrics,
             )?;
         }
-        let fs = self.fs.clone();
-        let info = Self::run_master_rpc_task(self.control_rpc_executor.clone(), move || {
-            Self::process_get_filesystem_info(fs)
-        })
-        .await?;
+        let info = Self::process_get_filesystem_info(self.fs.clone())?;
         let rep_header = Self::build_filesystem_info_response(info, &self.master_compatibility);
         ctx.response(rep_header)
     }
@@ -556,42 +576,6 @@ impl MasterHandler {
                     .collect(),
                 next_page_token: page.next_page_token,
                 epoch: page.epoch,
-            })
-        })
-        .await?;
-        ctx.response(response)
-    }
-
-    async fn async_get_cv_metadata_delta_page(
-        &self,
-        ctx: &mut RpcContext<'_>,
-    ) -> FsResult<Message> {
-        let req: GetCvMetadataDeltaPageRequest = ctx.parse_header()?;
-        ctx.set_audit(Some("cv-metadata-delta".to_string()), None);
-        let fs = self.fs.clone();
-        let response = Self::run_master_rpc_task(self.control_rpc_executor.clone(), move || {
-            let page = fs.cv_metadata_delta_page(
-                req.from_epoch,
-                req.target_epoch,
-                req.page_token,
-                req.page_size.unwrap_or(10_000) as usize,
-            )?;
-            Ok(GetCvMetadataDeltaPageResponse {
-                entries: page
-                    .entries
-                    .into_iter()
-                    .map(|entry| CvMetadataDeltaEntryProto {
-                        path: entry.path,
-                        entry: entry.entry.map(|entry| CvMetadataSnapshotEntryProto {
-                            status: ProtoUtils::file_status_to_pb(entry.status),
-                            blocks: entry.blocks.map(ProtoUtils::file_blocks_to_pb),
-                        }),
-                    })
-                    .collect(),
-                next_page_token: page.next_page_token,
-                from_epoch: page.from_epoch,
-                to_epoch: page.to_epoch,
-                full_snapshot_required: page.full_snapshot_required,
             })
         })
         .await?;
@@ -655,22 +639,18 @@ impl MasterHandler {
         // and clear every other label for the peer; otherwise a peer whose
         // verdict changes over time leaves stale series stuck at 1.
         let verdict_label = Self::verdict_label(&verdict);
-        let is_worker = dedup_key.starts_with("worker:");
-        for label in Self::VERDICT_LABELS {
-            let active = if label == verdict_label { 1 } else { 0 };
-            if is_worker {
-                let worker_id = &dedup_key["worker:".len()..];
+        if let Some(worker_id) = dedup_key.strip_prefix("worker:") {
+            for label in Self::VERDICT_LABELS {
+                let active = if label == verdict_label { 1 } else { 0 };
                 metrics
                     .compat_worker_verdict
                     .with_label_values(&[worker_id, label])
                     .set(active);
-            } else {
-                metrics
-                    .compat_client_verdict
-                    .with_label_values(&[dedup_key, label])
-                    .set(active);
             }
         }
+        // Client verdicts are not recorded here: client addresses are not
+        // bounded by cluster size, so `get_filesystem_info` aggregates them by
+        // release version through `MasterMetrics::record_client_compat`.
 
         if !verdict.rejects(mode) {
             if !verdict.is_compatible() {
@@ -1002,6 +982,24 @@ impl MasterHandler {
         fs.list_options(&path, opts)
     }
 
+    fn uses_actor_rt(code: RpcCode) -> bool {
+        matches!(code, RpcCode::WorkerHeartbeat | RpcCode::WorkerBlockReport)
+    }
+
+    fn record_rpc_queue_duration(&self, ctx: &RpcContext<'_>) {
+        if let Some(queue_us) = ctx.queue_us {
+            let executor = if Self::uses_actor_rt(ctx.code) {
+                "actor"
+            } else {
+                "main"
+            };
+            self.metrics
+                .rpc_queue_duration
+                .with_label_values(&[executor])
+                .observe(queue_us as f64);
+        }
+    }
+
     fn record_rpc_observability(&self, ctx: &RpcContext<'_>, response: &FsResult<Message>) {
         let used_us = ctx.spent.used_us();
         if self.audit_logging_enabled {
@@ -1012,12 +1010,10 @@ impl MasterHandler {
         self.metrics.rpc_request_total_time.inc_by(used_us as i64);
         self.metrics.rpc_request_total_count.inc();
 
-        if ctx.code != RpcCode::WorkerHeartbeat {
-            self.metrics
-                .operation_duration
-                .with_label_values(&[&code_label])
-                .observe(used_us as f64);
-        };
+        self.metrics
+            .operation_duration
+            .with_label_values(&[&code_label])
+            .observe(used_us as f64);
     }
 }
 
@@ -1038,9 +1034,7 @@ impl MessageHandler for MasterHandler {
                 | RpcCode::GetJobStatus
                 | RpcCode::CancelJob
                 | RpcCode::ReportTask
-                | RpcCode::GetFilesystemInfo
                 | RpcCode::GetCvMetadataSnapshotPage
-                | RpcCode::GetCvMetadataDeltaPage
         )
     }
 
@@ -1059,6 +1053,8 @@ impl MessageHandler for MasterHandler {
         let mut rpc_context = RpcContext::new(msg);
         let ctx = &mut rpc_context;
         let code = RpcCode::from(msg.code());
+
+        self.record_rpc_queue_duration(ctx);
 
         // Unified processing of all RPC requests (standby NotLeader uses the same
         // observability + error_ext conversion path as async_handle).
@@ -1083,6 +1079,8 @@ impl MessageHandler for MasterHandler {
                 RpcCode::ListStatus => self.list_status(ctx),
                 RpcCode::ListOptions => self.list_options(ctx),
                 RpcCode::GetBlockLocations => self.get_block_locations(ctx),
+                RpcCode::GetFileBlockDetails => self.get_file_block_details(ctx),
+                RpcCode::GetFilesystemInfo => self.get_filesystem_info(ctx),
                 RpcCode::SetAttr => self.set_attr_retry_check(ctx),
                 RpcCode::Symlink => self.symlink_retry_check(ctx),
                 RpcCode::Link => self.link_retry_check(ctx),
@@ -1149,11 +1147,9 @@ impl MessageHandler for MasterHandler {
                 RpcCode::GetJobStatus => self.job_handler.get_load_status(ctx),
                 RpcCode::CancelJob => self.job_handler.cancel_job(ctx).await,
                 RpcCode::ReportTask => self.job_handler.task_report(ctx),
-                RpcCode::GetFilesystemInfo => self.async_get_filesystem_info(ctx).await,
                 RpcCode::GetCvMetadataSnapshotPage => {
                     self.async_get_cv_metadata_snapshot_page(ctx).await
                 }
-                RpcCode::GetCvMetadataDeltaPage => self.async_get_cv_metadata_delta_page(ctx).await,
 
                 v => err_box!("unsupported operation {:?}", v),
             }
@@ -1167,12 +1163,13 @@ impl MessageHandler for MasterHandler {
         }
     }
 
+    // Only WorkerHeartbeat and WorkerBlockReport are routed to actor_rt;
+    // GetFilesystemInfo (statfs) deliberately runs on the main RPC blocking pool
+    // so that FUSE/kubelet statfs bursts cannot delay heartbeats and cause workers
+    // to be marked lost.
     fn get_rt(&self, msg: &Message) -> Option<&Runtime> {
         let code = RpcCode::from(msg.code());
-        if matches!(
-            code,
-            RpcCode::WorkerHeartbeat | RpcCode::WorkerBlockReport | RpcCode::GetFilesystemInfo
-        ) {
+        if Self::uses_actor_rt(code) {
             Some(&self.actor_rt)
         } else {
             None
@@ -1542,7 +1539,7 @@ mod tests {
             1
         );
 
-        // Client verdicts use the client gauge.
+        // Client verdicts are aggregated by `record_client_compat`, not here.
         MasterHandler::check_peer_compatibility(
             "client",
             "client:10.0.0.1",
@@ -1552,13 +1549,6 @@ mod tests {
             metrics,
         )
         .unwrap();
-        assert_eq!(
-            metrics
-                .compat_client_verdict
-                .with_label_values(&["client:10.0.0.1", "missing_info"])
-                .get(),
-            1
-        );
     }
 
     #[test]

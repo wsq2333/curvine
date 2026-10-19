@@ -22,7 +22,7 @@ use curvine_model::ProtoUtils;
 use curvine_model::{
     BlockLocation, BlockReportInfo, BlockReportList, BlockReportStatus, ClientAddress, CommitBlock,
     CreateFileOpts, CreateFileOptsBuilder, DeleteResult, FileAllocOpts, LocatedBlock,
-    MkdirOptsBuilder, StorageType, TtlAction, WorkerAddress, WorkerInfo,
+    MkdirOptsBuilder, StorageType, TtlAction, WorkerAddress, WorkerInfo, WorkerStatus,
 };
 use curvine_model::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
 use curvine_proto::{
@@ -308,9 +308,7 @@ fn control_plane_requests_use_the_async_handler() {
         RpcCode::GetJobStatus,
         RpcCode::CancelJob,
         RpcCode::ReportTask,
-        RpcCode::GetFilesystemInfo,
         RpcCode::GetCvMetadataSnapshotPage,
-        RpcCode::GetCvMetadataDeltaPage,
     ] {
         let msg = Builder::new_rpc(code).build();
         assert!(
@@ -325,6 +323,7 @@ fn control_plane_requests_use_the_async_handler() {
         RpcCode::ListOptions,
         RpcCode::WorkerHeartbeat,
         RpcCode::WorkerBlockReport,
+        RpcCode::GetFilesystemInfo,
     ] {
         let msg = Builder::new_rpc(code).build();
         assert!(handler.is_sync(&msg), "{code:?} must use the sync handler");
@@ -332,6 +331,22 @@ fn control_plane_requests_use_the_async_handler() {
 
     let mkdir = Builder::new_rpc(RpcCode::Mkdir).build();
     assert!(handler.is_sync(&mkdir));
+
+    // Pin the actor-runtime routing: only heartbeat and block report must
+    // use actor_rt; GetFilesystemInfo (statfs) must run on the main pool so
+    // that statfs bursts cannot delay heartbeats.
+    let fs_info_msg = Builder::new_rpc(RpcCode::GetFilesystemInfo).build();
+    assert!(
+        handler.get_rt(&fs_info_msg).is_none(),
+        "GetFilesystemInfo must NOT be routed to actor_rt"
+    );
+    for code in [RpcCode::WorkerHeartbeat, RpcCode::WorkerBlockReport] {
+        let msg = Builder::new_rpc(code).build();
+        assert!(
+            handler.get_rt(&msg).is_some(),
+            "{code:?} must be routed to actor_rt"
+        );
+    }
 }
 
 #[test]
@@ -347,6 +362,74 @@ fn sync_rpc_to_standby_returns_rpc_error_response() -> CommonResult<()> {
     assert!(!response.is_success());
     let err = response.check_error_ext::<FsError>().unwrap_err();
     assert!(matches!(err, FsError::NotLeaderMaster(_)));
+    Ok(())
+}
+
+// rpc_queue_duration is derived from the timestamp RpcFrame::receive stamps on
+// decoded requests, and its executor label must mirror the actor_rt split in
+// MasterHandler::get_rt. Both facts need a regression guard: without set_time()
+// or the record call the metric stays silently empty, and without the label
+// actor-routed requests would pollute the main-pool signal.
+fn rpc_queue_count(fs: &MasterFilesystem, executor: &str) -> u64 {
+    let text = Master::get_metrics()
+        .expect("test master metrics should initialize")
+        .text_output(fs.clone())
+        .expect("metrics text output should render");
+    let prefix = format!("rpc_queue_duration_count{{executor=\"{executor}\"}}");
+    text.lines()
+        .find_map(|line| line.strip_prefix(&prefix)?.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+#[test]
+fn rpc_queue_duration_is_recorded_per_executor_pool() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler_for_test("rpc-queue-duration");
+    let fs = new_fs(true, "rpc-queue-duration-metrics");
+
+    let main_before = rpc_queue_count(&fs, "main");
+    let actor_before = rpc_queue_count(&fs, "actor");
+
+    // A stamped request must record its queue wait into the main pool series.
+    let mut main_req = Builder::new_rpc(RpcCode::Mkdir).build();
+    main_req.set_time();
+    handler.handle(&main_req)?;
+    assert_eq!(
+        rpc_queue_count(&fs, "main"),
+        main_before + 1,
+        "a stamped main-pool request must add exactly one rpc_queue_duration sample"
+    );
+
+    // WorkerBlockReport runs on actor_rt (get_rt), so it must land in the
+    // actor series instead of polluting the main-pool signal.
+    let mut report_req = Builder::new_rpc(RpcCode::WorkerBlockReport).build();
+    report_req.set_time();
+    handler.handle(&report_req)?;
+    assert_eq!(
+        rpc_queue_count(&fs, "actor"),
+        actor_before + 1,
+        "a stamped WorkerBlockReport must be recorded under executor=actor"
+    );
+    assert_eq!(
+        rpc_queue_count(&fs, "main"),
+        main_before + 1,
+        "actor-routed requests must not increment the main series"
+    );
+
+    // Messages without a receipt timestamp (not decoded by RpcFrame) record
+    // nothing.
+    let unstamped = Builder::new_rpc(RpcCode::Mkdir).build();
+    assert!(
+        unstamped.time.is_none(),
+        "builder must default to no receipt time"
+    );
+    handler.handle(&unstamped)?;
+    assert_eq!(
+        rpc_queue_count(&fs, "main"),
+        main_before + 1,
+        "a request without receipt time must not add a sample"
+    );
+
     Ok(())
 }
 
@@ -376,6 +459,7 @@ fn block_report_for_non_file_inode_schedules_worker_delete() -> CommonResult<()>
 
     let result = fs.block_report(
         BlockReportList {
+            report_id: 0,
             cluster_id: "curvine".into(),
             worker_id: 0,
             full_report: false,
@@ -404,6 +488,7 @@ fn block_report_for_writing_non_file_inode_defers_worker_delete() -> CommonResul
 
     let result = fs.block_report(
         BlockReportList {
+            report_id: 0,
             cluster_id: "curvine".into(),
             worker_id: 0,
             full_report: false,
@@ -432,6 +517,7 @@ fn block_report_for_writing_missing_inode_defers_worker_delete() -> CommonResult
 
     let result = fs.block_report(
         BlockReportList {
+            report_id: 0,
             cluster_id: "curvine".into(),
             worker_id: 0,
             full_report: false,
@@ -460,6 +546,7 @@ fn full_block_report_for_writing_missing_inode_schedules_worker_delete() -> Comm
 
     let result = fs.block_report(
         BlockReportList {
+            report_id: 0,
             cluster_id: "curvine".into(),
             worker_id: 0,
             full_report: true,
@@ -500,6 +587,7 @@ fn full_block_report_default_limit_to_master() -> CommonResult<()> {
         .collect();
 
     let req = BlockReportListRequest {
+        report_id: None,
         cluster_id: "curvine".into(),
         worker_id,
         full_report: true,
@@ -524,6 +612,7 @@ fn full_block_report_default_limit_to_master() -> CommonResult<()> {
 
     let result = fs.block_report(
         BlockReportList {
+            report_id: 0,
             cluster_id: "curvine".into(),
             worker_id,
             full_report: true,
@@ -568,6 +657,7 @@ fn full_block_report_reconcile_removes_stale_location_async() -> CommonResult<()
 
     fs.block_report(
         BlockReportList {
+            report_id: 0,
             cluster_id: "curvine".into(),
             worker_id: 100,
             full_report: false,
@@ -596,6 +686,7 @@ fn full_block_report_reconcile_removes_stale_location_async() -> CommonResult<()
 
     fs.block_report(
         BlockReportList {
+            report_id: 0,
             cluster_id: "curvine".into(),
             worker_id: 100,
             full_report: true,
@@ -835,6 +926,7 @@ fn incremental_report_invalidates_incomplete_full_report_session() -> CommonResu
 
     fs.block_report(
         BlockReportList {
+            report_id: 0,
             cluster_id: "curvine".into(),
             worker_id: 100,
             full_report: false,
@@ -865,6 +957,7 @@ fn incremental_report_invalidates_incomplete_full_report_session() -> CommonResu
 
     fs.block_report(
         BlockReportList {
+            report_id: 0,
             cluster_id: "curvine".into(),
             worker_id: 100,
             full_report: true,
@@ -881,6 +974,7 @@ fn incremental_report_invalidates_incomplete_full_report_session() -> CommonResu
 
     fs.block_report(
         BlockReportList {
+            report_id: 0,
             cluster_id: "curvine".into(),
             worker_id: 100,
             full_report: false,
@@ -897,6 +991,7 @@ fn incremental_report_invalidates_incomplete_full_report_session() -> CommonResu
 
     fs.block_report(
         BlockReportList {
+            report_id: 0,
             cluster_id: "curvine".into(),
             worker_id: 100,
             full_report: true,
@@ -943,6 +1038,7 @@ fn ttl_executor_deletes_nested_expired_inode() -> CommonResult<()> {
         opts,
         OpenFlags::new_create().set_overwrite(true),
     )?;
+    fs.complete_file("/ttl/a/b/file.log", None, 0, vec![], "", false, None)?;
 
     std::thread::sleep(Duration::from_millis(10));
     let executor = InodeTtlExecutor::with_managers(fs.clone());
@@ -956,6 +1052,41 @@ fn ttl_executor_deletes_nested_expired_inode() -> CommonResult<()> {
     assert!(
         fs.file_status("/ttl/a/b/file.log").is_err(),
         "TTL delete should remove the nested file path resolved from inode id"
+    );
+
+    Ok(())
+}
+
+// A missing inode must surface as a typed FileNotFound error; the TTL
+// checker relies on this classification to skip benign warnings.
+#[test]
+fn ttl_executor_missing_inode_returns_file_not_found() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "ttl-executor-missing-inode");
+
+    let opts = CreateFileOptsBuilder::new()
+        .create_parent(true)
+        .ttl_ms(1)
+        .ttl_action(TtlAction::Delete)
+        .build();
+    let status = fs.create_with_opts(
+        "/ttl/removed.log",
+        opts,
+        OpenFlags::new_create().set_overwrite(true),
+    )?;
+    fs.complete_file("/ttl/removed.log", None, 0, vec![], "", false, None)?;
+
+    // Remove the inode before the TTL pass runs.
+    fs.delete("/ttl/removed.log", false)?;
+
+    let executor = InodeTtlExecutor::with_managers(fs.clone());
+    let err = executor
+        .execute_by_id(status.id)
+        .expect_err("execute_by_id must fail once the inode is removed");
+    assert!(
+        matches!(err, FsError::FileNotFound(_)),
+        "missing inodes must be classified as FileNotFound, got: {:?}",
+        err
     );
 
     Ok(())
@@ -983,6 +1114,15 @@ fn ttl_executor_deletes_expired_directory_after_child_file() -> CommonResult<()>
         "/ttl/expired-dir/file.log",
         file_opts,
         OpenFlags::new_create().set_overwrite(true),
+    )?;
+    fs.complete_file(
+        "/ttl/expired-dir/file.log",
+        None,
+        0,
+        vec![],
+        "",
+        false,
+        None,
     )?;
 
     std::thread::sleep(Duration::from_millis(10));
@@ -1013,6 +1153,125 @@ fn ttl_executor_deletes_expired_directory_after_child_file() -> CommonResult<()>
     assert!(
         fs.file_status("/ttl/expired-dir").is_err(),
         "TTL delete should remove the expired directory, not only its child file"
+    );
+
+    Ok(())
+}
+
+// An expired directory must not take unexpired children with it. The
+// directory stays until those children are gone, then the next TTL pass
+// removes the empty directory.
+#[test]
+fn ttl_executor_skips_non_empty_expired_directory() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "ttl-executor-non-empty-dir");
+
+    let dir_opts = MkdirOptsBuilder::new()
+        .create_parent(true)
+        .ttl_ms(1)
+        .ttl_action(TtlAction::Delete)
+        .build();
+    let dir = fs.mkdir_with_opts("/ttl/live-children", dir_opts)?;
+
+    let file_opts = CreateFileOptsBuilder::new()
+        .ttl_ms(3_600_000)
+        .ttl_action(TtlAction::Delete)
+        .build();
+    fs.create_with_opts(
+        "/ttl/live-children/file.log",
+        file_opts,
+        OpenFlags::new_create().set_overwrite(true),
+    )?;
+
+    std::thread::sleep(Duration::from_millis(10));
+    let dir_mtime = fs.file_status("/ttl/live-children")?.mtime;
+    let executor = InodeTtlExecutor::with_managers(fs.clone());
+
+    let (dir_processed, inode) = executor.execute_by_id(dir.id)?;
+    assert!(
+        !dir_processed,
+        "expired directory with a live child must be deferred"
+    );
+    assert_eq!(inode.id(), dir.id);
+    assert!(
+        fs.file_status("/ttl/live-children/file.log").is_ok(),
+        "unexpired child must survive the parent directory TTL"
+    );
+    assert_eq!(
+        fs.file_status("/ttl/live-children")?.mtime,
+        dir_mtime,
+        "deferring a non-empty directory must not refresh its mtime"
+    );
+
+    fs.delete("/ttl/live-children/file.log", false)?;
+    let (dir_processed, _) = executor.execute_by_id(dir.id)?;
+    assert!(
+        dir_processed,
+        "expired directory should be deleted once it is empty"
+    );
+    assert!(
+        fs.file_status("/ttl/live-children").is_err(),
+        "empty expired directory should be removed on the following TTL pass"
+    );
+
+    Ok(())
+}
+
+// Directory TTL Free must still run when children are present. Free drops
+// cached blocks and leaves the child file in place.
+#[test]
+fn ttl_executor_frees_child_blocks_of_expired_directory() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "ttl-executor-free-dir");
+
+    let dir_opts = MkdirOptsBuilder::new()
+        .create_parent(true)
+        .ttl_ms(1)
+        .ttl_action(TtlAction::Free)
+        .build();
+    let dir = fs.mkdir_with_opts("/ttl/free-dir", dir_opts)?;
+
+    let client = ClientAddress::default();
+    let file_path = "/ttl/free-dir/file.log";
+    let status = fs.create_with_opts(
+        file_path,
+        CreateFileOptsBuilder::new()
+            .ttl_ms(3_600_000)
+            .ttl_action(TtlAction::Free)
+            .build(),
+        OpenFlags::new_create(),
+    )?;
+    let block = fs.add_block(file_path, None, client.clone(), vec![], vec![], 0, None)?;
+    fs.complete_file(
+        file_path,
+        None,
+        status.block_size,
+        vec![full_commit(&block, status.block_size)],
+        &client.client_name,
+        false,
+        None,
+    )?;
+    fs.set_attr(file_path, SetAttrOptsBuilder::new().ufs_mtime(1).build())?;
+    assert!(
+        !fs.get_block_locations(file_path)?.block_locs.is_empty(),
+        "child file should have blocks before directory TTL free"
+    );
+
+    std::thread::sleep(Duration::from_millis(10));
+    let executor = InodeTtlExecutor::with_managers(fs.clone());
+    let (processed, inode) = executor.execute_by_id(dir.id)?;
+    assert!(
+        processed,
+        "directory TTL Free should run while a child file is still present"
+    );
+    assert_eq!(inode.id(), dir.id);
+    assert!(
+        fs.file_status(file_path).is_ok(),
+        "child file must remain after directory TTL Free"
+    );
+    assert!(
+        fs.get_block_locations(file_path)?.block_locs.is_empty(),
+        "directory TTL Free should drop the child file's cached blocks"
     );
 
     Ok(())
@@ -1509,6 +1768,13 @@ fn rename_posix_semantics(fs: &MasterFilesystem) -> CommonResult<()> {
         fs.file_status("/a/ex_file_parent")?.nlink,
         file_parent_nlink + 1
     );
+
+    // Cross-parent EXCHANGE of non-empty directories keeps each subtree with its directory.
+    let left_file = fs.create("/a/ex_left/dir/sub/file", true)?.id;
+    let right_file = fs.create("/a/ex_right/dir/file", true)?.id;
+    fs.rename("/a/ex_left/dir", "/a/ex_right/dir", RenameFlags::EXCHANGE)?;
+    assert_eq!(fs.file_status("/a/ex_right/dir/sub/file")?.id, left_file);
+    assert_eq!(fs.file_status("/a/ex_left/dir/file")?.id, right_file);
 
     // src symlink, dst symlink -> overwrite existing symlink and keep dst deletable.
     fs.symlink("nobody", "/a/symbolic", false, 0o777)?;
@@ -2660,6 +2926,7 @@ fn located_block_has_spdk_reflects_worker_reported_storage_type() -> CommonResul
 
         fs.block_report(
             BlockReportList {
+                report_id: 0,
                 cluster_id: "curvine".into(),
                 worker_id: block.locs[0].worker_id,
                 full_report: true,
@@ -2693,6 +2960,7 @@ fn located_block_has_spdk_reflects_worker_reported_storage_type() -> CommonResul
 
         fs.block_report(
             BlockReportList {
+                report_id: 0,
                 cluster_id: "curvine".into(),
                 worker_id: block.locs[0].worker_id,
                 full_report: true,
@@ -2726,6 +2994,7 @@ fn located_block_has_spdk_reflects_worker_reported_storage_type() -> CommonResul
 
         fs.block_report(
             BlockReportList {
+                report_id: 0,
                 cluster_id: "curvine".into(),
                 worker_id: block.locs[0].worker_id,
                 full_report: true,
@@ -2770,6 +3039,7 @@ fn located_block_has_spdk_reflects_worker_reported_storage_type() -> CommonResul
         // Worker 100 (default) reports block as SpdkDisk
         fs.block_report(
             BlockReportList {
+                report_id: 0,
                 cluster_id: "curvine".into(),
                 worker_id: 100,
                 full_report: true,
@@ -2787,6 +3057,7 @@ fn located_block_has_spdk_reflects_worker_reported_storage_type() -> CommonResul
         // Worker 200 reports same block as Disk
         fs.block_report(
             BlockReportList {
+                report_id: 0,
                 cluster_id: "curvine".into(),
                 worker_id: 200,
                 full_report: false,
@@ -2810,6 +3081,240 @@ fn located_block_has_spdk_reflects_worker_reported_storage_type() -> CommonResul
         );
     }
 
+    Ok(())
+}
+
+#[test]
+fn file_block_details_preserve_mixed_replica_storage_types() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "file-block-details-mixed-storage");
+    let path = "/mixed-storage.log";
+    let client = ClientAddress::default();
+    fs.create(path, false)?;
+
+    let second_worker = WorkerInfo::new(
+        WorkerAddress {
+            worker_id: 200,
+            hostname: "worker-200".to_string(),
+            ip_addr: "127.0.0.2".to_string(),
+            rpc_port: 667,
+            ..Default::default()
+        },
+        0,
+    );
+    fs.add_test_worker(second_worker);
+    let block = fs.add_block(path, None, client, vec![], vec![], 0, None)?;
+
+    for (worker_id, storage_type, full_report) in [
+        (block.locs[0].worker_id, StorageType::SpdkDisk, true),
+        (200, StorageType::Disk, false),
+    ] {
+        fs.block_report(
+            BlockReportList {
+                report_id: 0,
+                cluster_id: "curvine".into(),
+                worker_id,
+                full_report,
+                total_len: 1,
+                blocks: vec![BlockReportInfo::new(
+                    block.block.id,
+                    BlockReportStatus::Finalized,
+                    storage_type,
+                    block.block.len,
+                )],
+            },
+            None,
+        )?;
+    }
+
+    let details = fs.get_file_block_details(path)?;
+    assert_eq!(details.blocks[0].replicas.len(), 2);
+    assert_eq!(
+        details.blocks[0]
+            .replicas
+            .iter()
+            .map(|replica| (replica.worker_id, replica.storage_type))
+            .collect::<Vec<_>>(),
+        vec![
+            (block.locs[0].worker_id, StorageType::SpdkDisk),
+            (200, StorageType::Disk),
+        ]
+    );
+    assert!(details.blocks[0]
+        .replicas
+        .iter()
+        .all(|replica| replica.address.is_some()));
+    Ok(())
+}
+
+#[test]
+fn file_block_details_reject_missing_paths_and_directories() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "file-block-details-invalid-paths");
+
+    assert!(fs.get_file_block_details("/missing").is_err());
+    fs.mkdir("/directory", true)?;
+    assert!(fs.get_file_block_details("/directory").is_err());
+    Ok(())
+}
+
+#[test]
+fn file_block_details_compute_cumulative_offsets() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "file-block-details-offsets");
+    let client = ClientAddress::default();
+    let path = "/offsets.log";
+    let (file_len, last_commit) = prepare_flush_file(&fs, path, &client, 3)?;
+    fs.complete_file(
+        path,
+        None,
+        file_len,
+        vec![last_commit],
+        &client.client_name,
+        false,
+        None,
+    )?;
+
+    let details = fs.get_file_block_details(path)?;
+    assert_eq!(details.blocks.len(), 3);
+    assert_eq!(details.blocks[0].offset, 0);
+    assert_eq!(details.blocks[1].offset, details.blocks[0].len);
+    assert_eq!(
+        details.blocks[2].offset,
+        details.blocks[0].len + details.blocks[1].len
+    );
+    Ok(())
+}
+
+#[test]
+fn file_block_details_preserve_unknown_worker_locations() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "file-block-details-unknown-worker");
+    let path = "/unknown-worker.log";
+    let client = ClientAddress::default();
+    fs.create(path, false)?;
+    let block = fs.add_block(path, None, client, vec![], vec![], 0, None)?;
+    fs.fs_dir.read().add_block_location(
+        block.block.id,
+        BlockLocation::new(999_999, StorageType::Ssd),
+    )?;
+
+    let details = fs.get_file_block_details(path)?;
+    let unknown = details.blocks[0]
+        .replicas
+        .iter()
+        .find(|replica| replica.worker_id == 999_999)
+        .expect("unknown worker location should be retained");
+    assert_eq!(unknown.storage_type, StorageType::Ssd);
+    assert!(unknown.address.is_none());
+    assert_eq!(unknown.state, WorkerStatus::Unknown);
+    Ok(())
+}
+
+#[test]
+fn file_block_details_resolves_lost_worker_addresses() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "file-block-details-lost-worker");
+    let path = "/lost-worker.log";
+    let client = ClientAddress::default();
+    fs.create(path, false)?;
+    let block = fs.add_block(path, None, client, vec![], vec![], 0, None)?;
+    let worker_id = block.locs[0].worker_id;
+    let expected_address = block.locs[0].clone();
+    let reported_storage_type = StorageType::Ssd;
+    let location = BlockLocation::new(worker_id, reported_storage_type);
+    fs.fs_dir
+        .read()
+        .add_block_location(block.block.id, location.clone())?;
+
+    let live_details = fs.get_file_block_details(path)?;
+    let live_replica = live_details.blocks[0]
+        .replicas
+        .iter()
+        .find(|replica| replica.worker_id == worker_id)
+        .expect("live worker location should be retained");
+    assert!(live_replica.address.is_some());
+    assert_eq!(live_replica.state, WorkerStatus::Live);
+
+    fs.worker_manager
+        .write()
+        .remove_expired_worker(worker_id)
+        .expect("worker should move to lost map");
+
+    let details = fs.get_file_block_details(path)?;
+    assert_eq!(details.blocks.len(), 1);
+    assert_eq!(details.blocks[0].block_id, block.block.id);
+    assert_eq!(details.blocks[0].replicas.len(), 1);
+    let lost = &details.blocks[0].replicas[0];
+    assert_eq!(lost.worker_id, worker_id);
+    assert_eq!(lost.storage_type, reported_storage_type);
+    let lost_address = lost
+        .address
+        .as_ref()
+        .expect("lost worker address should be resolved from lost worker map");
+    assert_eq!(lost_address.worker_id, expected_address.worker_id);
+    assert_eq!(lost_address.hostname, expected_address.hostname);
+    assert_eq!(lost_address.ip_addr, expected_address.ip_addr);
+    assert_eq!(lost_address.rpc_port, expected_address.rpc_port);
+    assert_eq!(lost_address.web_port, expected_address.web_port);
+    assert_eq!(lost.state, WorkerStatus::Lost);
+
+    // Contrast: create_locate_block must use live-only get_worker; lost replicas must not be returned to readers.
+    assert!(
+        fs.create_locate_block(path, block.block.clone(), &[location])
+            .is_err(),
+        "read path must refuse a block whose only replica is on a lost worker"
+    );
+    Ok(())
+}
+
+#[test]
+fn file_block_details_preserve_registered_non_live_worker_status() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "file-block-details-non-live-worker");
+    let path = "/registered-non-live-worker.log";
+    let client = ClientAddress::default();
+    fs.create(path, false)?;
+    let block = fs.add_block(path, None, client, vec![], vec![], 0, None)?;
+    let worker_id = block.locs[0].worker_id;
+    let hostname = block.locs[0].hostname.clone();
+    let location = BlockLocation::new(worker_id, StorageType::Disk);
+    fs.fs_dir
+        .read()
+        .add_block_location(block.block.id, location.clone())?;
+
+    fs.worker_manager
+        .write()
+        .add_blacklist_worker(worker_id)
+        .expect("worker should be blacklisted");
+    let blacklist_details = fs.get_file_block_details(path)?;
+    let blacklist = blacklist_details.blocks[0]
+        .replicas
+        .iter()
+        .find(|replica| replica.worker_id == worker_id)
+        .expect("blacklisted worker location should be retained");
+    assert_eq!(blacklist.state, WorkerStatus::Blacklist);
+    assert!(blacklist.address.is_some());
+    // create_locate_block serves reads and keeps only live workers (#1731),
+    // so a blacklisted replica must not be returned to readers.
+    assert!(fs
+        .create_locate_block(path, block.block.clone(), std::slice::from_ref(&location))
+        .is_err());
+
+    fs.worker_manager.write().add_dcm(vec![hostname]);
+    let dcm_details = fs.get_file_block_details(path)?;
+    let decommission = dcm_details.blocks[0]
+        .replicas
+        .iter()
+        .find(|replica| replica.worker_id == worker_id)
+        .expect("decommissioned worker location should be retained");
+    assert_eq!(decommission.state, WorkerStatus::Decommission);
+    assert!(decommission.address.is_some());
+    // Same live-only locate contract: a decommissioned replica stays visible
+    // in block details but is not used for reads.
+    assert!(fs
+        .create_locate_block(path, block.block.clone(), &[location])
+        .is_err());
     Ok(())
 }
 
@@ -2873,5 +3378,78 @@ fn complete_file_with_set_attr_applies_attributes() -> CommonResult<()> {
         "xattr should be set by complete_file"
     );
 
+    Ok(())
+}
+
+fn full_report_batch(report_id: u64, total_len: u64, block_id: i64) -> BlockReportList {
+    BlockReportList {
+        report_id,
+        cluster_id: "curvine".into(),
+        worker_id: 0,
+        full_report: true,
+        total_len,
+        blocks: vec![BlockReportInfo::new(
+            block_id,
+            BlockReportStatus::Finalized,
+            StorageType::Disk,
+            1,
+        )],
+    }
+}
+
+#[test]
+fn resent_final_full_report_batch_is_ignored() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "full-report-resent-final");
+    fs.mkdir("/dir-full-report", true)?;
+    let dir_status = fs.file_status("/dir-full-report")?;
+    let first = InodeId::create_block_id(dir_status.id, 0)?;
+    let last = InodeId::create_block_id(dir_status.id, 1)?;
+
+    // Two batches complete the round; each block is rejected because its inode is a dir.
+    let res = fs.block_report(full_report_batch(7, 2, first), None)?;
+    assert_eq!(res.delete_blocks, vec![first]);
+    let res = fs.block_report(full_report_batch(7, 2, last), None)?;
+    assert_eq!(res.delete_blocks, vec![last]);
+
+    // The response to the final batch was lost and the worker resends it.
+    // The deletes it carried must be delivered again, but no new session opens.
+    assert_eq!(fs.full_report_completed_round(0), Some(7));
+    let res = fs.block_report(full_report_batch(7, 2, last), None)?;
+    assert_eq!(res.delete_blocks, vec![last]);
+    assert_eq!(fs.full_report_open_sessions(), 0, "resend opened a session");
+    assert_eq!(fs.full_report_completed_round(0), Some(7));
+
+    // A new round from the same worker is processed normally.
+    let res = fs.block_report(full_report_batch(8, 2, last), None)?;
+    assert_eq!(res.delete_blocks, vec![last]);
+
+    // Reports without an id keep the previous behavior.
+    let res = fs.block_report(full_report_batch(0, 2, last), None)?;
+    assert_eq!(res.delete_blocks, vec![last]);
+    let res = fs.block_report(full_report_batch(0, 2, last), None)?;
+    assert_eq!(res.delete_blocks, vec![last]);
+    Ok(())
+}
+
+#[test]
+fn reset_full_block_report_forgets_completed_round() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "full-report-reset");
+    fs.mkdir("/dir-full-report-reset", true)?;
+    let dir_status = fs.file_status("/dir-full-report-reset")?;
+    let block_id = InodeId::create_block_id(dir_status.id, 0)?;
+
+    let res = fs.block_report(full_report_batch(5, 1, block_id), None)?;
+    assert_eq!(res.delete_blocks, vec![block_id]);
+    let res = fs.block_report(full_report_batch(5, 1, block_id), None)?;
+    assert_eq!(res.delete_blocks, vec![block_id]);
+    assert_eq!(fs.full_report_completed_round(0), Some(5));
+
+    // The worker registered again, so its previous round must be forgotten.
+    fs.reset_full_block_report(0);
+    assert_eq!(fs.full_report_completed_round(0), None);
+    let res = fs.block_report(full_report_batch(5, 1, block_id), None)?;
+    assert_eq!(res.delete_blocks, vec![block_id]);
     Ok(())
 }

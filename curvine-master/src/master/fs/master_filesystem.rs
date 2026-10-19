@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::master::fs::context::ValidateAddBlock;
+use crate::master::fs::full_block_report::{FullReportProgress, FullReportTracker};
 use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::JournalSystem;
 use crate::master::meta::inode::{InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR};
@@ -32,7 +33,7 @@ use curvine_runtime::runtime::GroupExecutor;
 use curvine_runtime::sync::ArcRwLock;
 use log::{error, info, warn};
 use parking_lot::Mutex;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 pub struct CvMetadataSnapshotEntry {
@@ -44,19 +45,6 @@ pub struct CvMetadataSnapshotPage {
     pub entries: Vec<CvMetadataSnapshotEntry>,
     pub next_page_token: Option<String>,
     pub epoch: u64,
-}
-
-pub struct CvMetadataDeltaEntry {
-    pub path: String,
-    pub entry: Option<CvMetadataSnapshotEntry>,
-}
-
-pub struct CvMetadataDeltaPage {
-    pub entries: Vec<CvMetadataDeltaEntry>,
-    pub next_page_token: Option<String>,
-    pub from_epoch: u64,
-    pub to_epoch: u64,
-    pub full_snapshot_required: bool,
 }
 
 struct CompleteFileOptions {
@@ -71,7 +59,7 @@ pub struct MasterFilesystem {
     pub worker_manager: SyncWorkerManager,
     pub master_monitor: MasterMonitor,
     pub conf: Arc<MasterConf>,
-    full_block_reports: Arc<Mutex<HashMap<u32, FullBlockReportState>>>,
+    full_report_tracker: FullReportTracker,
     full_block_reconciles: Arc<Mutex<HashMap<u32, FullBlockReconcileState>>>,
     full_block_reconcile_executor: Arc<GroupExecutor>,
 }
@@ -109,13 +97,6 @@ fn snapshot_token_in_subtree(token: &str, subtree_path: &str) -> bool {
                 .unwrap_or(false))
 }
 
-struct FullBlockReportState {
-    total_len: u64,
-    update_time_ms: u64,
-    reported_blocks: HashSet<i64>,
-    invalidated: bool,
-}
-
 struct FullBlockReconcileState {
     running: bool,
     generation: u64,
@@ -127,7 +108,6 @@ struct FullBlockReconcileJob {
     reported_blocks: HashSet<i64>,
 }
 
-const FULL_BLOCK_REPORT_TTL_MS: u64 = 60 * 60 * 1000;
 const FULL_BLOCK_RECONCILE_THREADS: usize = 2;
 const FULL_BLOCK_RECONCILE_QUEUE_SIZE: usize = 128;
 
@@ -170,7 +150,7 @@ impl MasterFilesystem {
             worker_manager,
             master_monitor,
             conf: Arc::new(conf.master.clone()),
-            full_block_reports: Default::default(),
+            full_report_tracker: Default::default(),
             full_block_reconciles: Default::default(),
             full_block_reconcile_executor: Arc::new(GroupExecutor::new(
                 "master-full-block-reconcile",
@@ -186,7 +166,7 @@ impl MasterFilesystem {
             worker_manager: js.worker_manager(),
             master_monitor: js.master_monitor(),
             conf: Arc::new(conf.master.clone()),
-            full_block_reports: Default::default(),
+            full_report_tracker: Default::default(),
             full_block_reconciles: Default::default(),
             full_block_reconcile_executor: Arc::new(GroupExecutor::new(
                 "master-full-block-reconcile",
@@ -850,6 +830,87 @@ impl MasterFilesystem {
         Ok(locate_blocks)
     }
 
+    pub fn get_file_block_details<T: AsRef<str>>(&self, path: T) -> FsResult<FileBlockDetails> {
+        let path = path.as_ref();
+
+        let (status, block_snapshots, worker_snapshots) = {
+            let fs_dir = self.fs_dir.read();
+            let inp = Self::resolve_path(&fs_dir, path)?;
+            let inode = match inp.get_last_inode() {
+                Some(inode) => inode,
+                None => return err_ext!(FsError::file_not_found(path)),
+            };
+            let file = inode.as_file_ref()?;
+            let file_locs = fs_dir.get_file_locations(file)?;
+            let status = inode.to_file_status(path)?;
+            let mut offset = 0;
+            let mut block_snapshots = Vec::with_capacity(file.blocks.len());
+            let mut worker_ids = HashSet::new();
+
+            for meta in &file.blocks {
+                let len = meta.len();
+                let replicas = file_locs.get(&meta.id).cloned().unwrap_or_default();
+                for replica in &replicas {
+                    worker_ids.insert(replica.worker_id);
+                }
+                block_snapshots.push((meta.id, len, offset, replicas));
+                offset += len;
+            }
+
+            // Snapshot worker state under the existing fs_dir -> worker_manager lock order.
+            let worker_snapshots = {
+                let worker_manager = self.worker_manager.read();
+                worker_ids
+                    .into_iter()
+                    .map(|worker_id| {
+                        let (address, state) = if let Some(worker) =
+                            worker_manager.get_worker(worker_id)
+                        {
+                            (Some(worker.address.clone()), worker.status)
+                        } else if let Some(worker) = worker_manager.get_known_worker(worker_id) {
+                            (Some(worker.address.clone()), WorkerStatus::Lost)
+                        } else {
+                            (None, WorkerStatus::Unknown)
+                        };
+                        (worker_id, (address, state))
+                    })
+                    .collect::<HashMap<_, _>>()
+            };
+
+            (status, block_snapshots, worker_snapshots)
+        };
+
+        let blocks = block_snapshots
+            .into_iter()
+            .map(|(block_id, len, offset, locations)| {
+                let mut replicas = locations
+                    .into_iter()
+                    .map(|location| BlockReplicaDetail {
+                        worker_id: location.worker_id,
+                        storage_type: location.storage_type,
+                        address: worker_snapshots
+                            .get(&location.worker_id)
+                            .and_then(|(address, _)| address.clone()),
+                        state: worker_snapshots
+                            .get(&location.worker_id)
+                            .map(|(_, state)| *state)
+                            .unwrap_or(WorkerStatus::Unknown),
+                    })
+                    .collect::<Vec<_>>();
+                replicas.sort_by_key(|replica| replica.worker_id);
+
+                FileBlockDetail {
+                    block_id,
+                    len,
+                    offset,
+                    replicas,
+                }
+            })
+            .collect();
+
+        Ok(FileBlockDetails { status, blocks })
+    }
+
     pub fn cv_metadata_snapshot_page(
         &self,
         page_token: Option<String>,
@@ -887,175 +948,6 @@ impl MasterFilesystem {
             next_page_token,
             epoch,
         })
-    }
-
-    pub fn cv_metadata_delta_page(
-        &self,
-        from_epoch: u64,
-        target_epoch: Option<u64>,
-        page_token: Option<String>,
-        page_size: usize,
-    ) -> FsResult<CvMetadataDeltaPage> {
-        if page_size == 0 {
-            return err_box!("cv metadata delta page_size must be greater than 0");
-        }
-
-        let fs_dir = self.fs_dir.read();
-        let current_epoch = fs_dir.op_id.get();
-        let to_epoch = target_epoch.unwrap_or(current_epoch);
-        if to_epoch > current_epoch {
-            return err_box!(
-                "cv metadata delta target_epoch {} is newer than current epoch {}",
-                to_epoch,
-                current_epoch
-            );
-        }
-        if from_epoch > to_epoch {
-            return err_box!(
-                "cv metadata delta from_epoch {} is newer than target epoch {}",
-                from_epoch,
-                to_epoch
-            );
-        }
-        if target_epoch.is_some() && to_epoch < current_epoch {
-            return Ok(CvMetadataDeltaPage {
-                entries: Vec::new(),
-                next_page_token: None,
-                from_epoch,
-                to_epoch,
-                full_snapshot_required: true,
-            });
-        }
-        if from_epoch == to_epoch {
-            return Ok(CvMetadataDeltaPage {
-                entries: Vec::new(),
-                next_page_token: None,
-                from_epoch,
-                to_epoch,
-                full_snapshot_required: false,
-            });
-        }
-
-        let Some(changes) = fs_dir
-            .journal_writer
-            .cv_metadata_changes_since(from_epoch, to_epoch)
-        else {
-            return Ok(CvMetadataDeltaPage {
-                entries: Vec::new(),
-                next_page_token: None,
-                from_epoch,
-                to_epoch,
-                full_snapshot_required: true,
-            });
-        };
-
-        let mut changed_paths = BTreeMap::new();
-        for change in changes {
-            changed_paths
-                .entry(change.path)
-                .and_modify(|include_subtree| *include_subtree |= change.include_subtree)
-                .or_insert(change.include_subtree);
-        }
-
-        let mut delta_entries = BTreeMap::new();
-        for (path, include_subtree) in changed_paths {
-            if include_subtree {
-                self.collect_cv_metadata_delta_subtree(&fs_dir, &path, &mut delta_entries)?;
-            } else {
-                let entry = self.cv_metadata_entry_for_path(&fs_dir, &path)?;
-                delta_entries.insert(path, entry);
-            }
-        }
-
-        let start_after = page_token.filter(|token| !token.is_empty());
-        let mut page_entries = Vec::with_capacity(page_size.saturating_add(1));
-        for (path, entry) in delta_entries {
-            if start_after
-                .as_deref()
-                .map(|token| path.as_str() <= token)
-                .unwrap_or(false)
-            {
-                continue;
-            }
-            page_entries.push(CvMetadataDeltaEntry { path, entry });
-            if page_entries.len() > page_size {
-                break;
-            }
-        }
-
-        let next_page_token = if page_entries.len() > page_size {
-            let token = page_entries
-                .get(page_size.saturating_sub(1))
-                .map(|entry| entry.path.clone());
-            page_entries.truncate(page_size);
-            token
-        } else {
-            None
-        };
-
-        Ok(CvMetadataDeltaPage {
-            entries: page_entries,
-            next_page_token,
-            from_epoch,
-            to_epoch,
-            full_snapshot_required: false,
-        })
-    }
-
-    fn collect_cv_metadata_delta_subtree(
-        &self,
-        fs_dir: &FsDir,
-        path: &str,
-        entries: &mut BTreeMap<String, Option<CvMetadataSnapshotEntry>>,
-    ) -> FsResult<()> {
-        let Some(entry) = self.cv_metadata_entry_for_path(fs_dir, path)? else {
-            entries.insert(path.to_string(), None);
-            return Ok(());
-        };
-
-        let is_dir = entry.status.is_dir;
-        entries.insert(path.to_string(), Some(entry));
-        if !is_dir {
-            return Ok(());
-        }
-
-        let inp = Self::resolve_path(fs_dir, path)?;
-        let Some(inode) = inp.get_last_inode() else {
-            return Ok(());
-        };
-        let resolved = self.resolve_snapshot_inode(fs_dir, &inode)?;
-        if let InodeView::Dir(dir) = resolved {
-            for child in dir.children_iter() {
-                let child_path = child_snapshot_path(path, child.name());
-                self.collect_cv_metadata_delta_subtree(fs_dir, &child_path, entries)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn cv_metadata_entry_for_path(
-        &self,
-        fs_dir: &FsDir,
-        path: &str,
-    ) -> FsResult<Option<CvMetadataSnapshotEntry>> {
-        let inp = match Self::resolve_path(fs_dir, path) {
-            Ok(inp) => inp,
-            Err(_) => return Ok(None),
-        };
-        let Some(inode) = inp.get_last_inode() else {
-            return Ok(None);
-        };
-        let resolved = self.resolve_snapshot_inode(fs_dir, &inode)?;
-        let status = resolved.to_file_status(path)?;
-        let blocks = if let Ok(file) = resolved.as_file_ref() {
-            Some(FileBlocks::new(
-                status.clone(),
-                self.get_block_locs(path, fs_dir, file)?,
-            ))
-        } else {
-            None
-        };
-        Ok(Some(CvMetadataSnapshotEntry { status, blocks }))
     }
 
     fn collect_cv_metadata_snapshot_page(
@@ -1212,78 +1104,26 @@ impl MasterFilesystem {
         fs_dir.block_inode_state(id)
     }
 
-    fn collect_full_block_report(&self, list: &BlockReportList) -> Option<HashSet<i64>> {
-        if !list.full_report {
-            return None;
-        }
-
-        let now = LocalTime::mills();
-        let mut reports = self.full_block_reports.lock();
-        reports.retain(|_, report| {
-            now.saturating_sub(report.update_time_ms) <= FULL_BLOCK_REPORT_TTL_MS
-        });
-        // A prior incremental report may have invalidated the session. Drop it so
-        // this full report can start a fresh accumulation instead of being ignored.
-        if reports
-            .get(&list.worker_id)
-            .map(|report| report.invalidated)
-            .unwrap_or(false)
-        {
-            reports.remove(&list.worker_id);
-        }
-
-        let report = reports
-            .entry(list.worker_id)
-            .or_insert_with(|| FullBlockReportState {
-                total_len: list.total_len,
-                update_time_ms: now,
-                reported_blocks: HashSet::with_capacity(list.total_len as usize),
-                invalidated: false,
-            });
-
-        if report.total_len != list.total_len {
-            warn!(
-                "full block report for worker {} restarted because total_len changed from {} to {}; discarding {} accumulated block ids",
-                list.worker_id,
-                report.total_len,
-                list.total_len,
-                report.reported_blocks.len()
-            );
-            report.total_len = list.total_len;
-            report.reported_blocks.clear();
-            report.reported_blocks.reserve(list.total_len as usize);
-            report.invalidated = false;
-        }
-        report.update_time_ms = now;
-
-        for block in &list.blocks {
-            report.reported_blocks.insert(block.id);
-        }
-
-        if report.reported_blocks.len() as u64 >= report.total_len {
-            reports
-                .remove(&list.worker_id)
-                .map(|report| report.reported_blocks)
-        } else {
-            None
-        }
-    }
-
     pub fn reset_full_block_report(&self, worker_id: u32) {
-        self.full_block_reports.lock().remove(&worker_id);
+        self.full_report_tracker.reset(worker_id);
         self.invalidate_full_block_reconcile(worker_id);
     }
 
+    /// Report id of the last fully processed full report of the worker.
+    #[doc(hidden)]
+    pub fn full_report_completed_round(&self, worker_id: u32) -> Option<u64> {
+        self.full_report_tracker.completed_round(worker_id)
+    }
+
+    /// Number of workers with a partially accumulated full report.
+    #[doc(hidden)]
+    pub fn full_report_open_sessions(&self) -> usize {
+        self.full_report_tracker.open_sessions()
+    }
+
     fn invalidate_full_block_report_session(&self, worker_id: u32) {
-        let now = LocalTime::mills();
-        let mut reports = self.full_block_reports.lock();
-        // Only invalidate an in-flight session. Inserting a stub invalidated
-        // entry would make the next full report return None forever.
-        if let Some(report) = reports.get_mut(&worker_id) {
-            report.update_time_ms = now;
-            report.reported_blocks.clear();
-            report.invalidated = true;
-        }
+        self.full_report_tracker
+            .invalidate_session(worker_id, LocalTime::mills());
     }
 
     fn invalidate_full_block_state(&self, worker_id: u32) {
@@ -1320,7 +1160,32 @@ impl MasterFilesystem {
             self.invalidate_full_block_state(list.worker_id);
         }
 
-        let full_reported_blocks = self.collect_full_block_report(&list);
+        let full_reported_blocks = match self.full_report_tracker.collect(&list, LocalTime::mills())
+        {
+            FullReportProgress::Duplicate => {
+                // The response to this batch may have been lost, so its delete
+                // commands and location updates must still be delivered. Both are
+                // idempotent; only the session and the reconcile are skipped.
+                info!(
+                    "resent batch of completed full block report {} from worker {}: not reconciling again",
+                    list.report_id, list.worker_id
+                );
+                None
+            }
+            FullReportProgress::InFlight => {
+                // The first attempt may still fail, so do not acknowledge the resend.
+                // The worker retries IO errors after a short backoff.
+                return Err(FsError::io(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    format!(
+                        "full block report {} from worker {} is still being processed",
+                        list.report_id, list.worker_id
+                    ),
+                )));
+            }
+            FullReportProgress::Complete(blocks) => Some(blocks),
+            FullReportProgress::Partial => None,
+        };
         if list.blocks.is_empty() && full_reported_blocks.is_none() {
             return Ok(BlockReportResult {
                 delete_blocks: Vec::new(),
@@ -1413,11 +1278,35 @@ impl MasterFilesystem {
         }
         drop(wm);
 
-        if let Some(reported_blocks) = full_reported_blocks {
-            self.submit_full_block_reconcile(list.worker_id, reported_blocks, replication_handler)?;
-        }
+        // Keep the block ids of a completing batch so a failure can be retried.
+        let retry_blocks = full_reported_blocks.clone();
+        let applied = (|| -> FsResult<()> {
+            if let Some(reported_blocks) = full_reported_blocks {
+                self.submit_full_block_reconcile(
+                    list.worker_id,
+                    reported_blocks,
+                    replication_handler,
+                )?;
+            }
+            self.apply_block_report_batch(batch)
+        })();
 
-        self.apply_block_report_batch(batch)?;
+        if let Some(blocks) = retry_blocks {
+            let now = LocalTime::mills();
+            match &applied {
+                Ok(()) => self
+                    .full_report_tracker
+                    .finish(list.worker_id, list.report_id, now),
+                Err(_) => self.full_report_tracker.abort(
+                    list.worker_id,
+                    list.report_id,
+                    list.total_len,
+                    blocks,
+                    now,
+                ),
+            }
+        }
+        applied?;
 
         Ok(BlockReportResult { delete_blocks })
     }
@@ -1856,6 +1745,114 @@ mod tests {
     fn truncate_growth_does_not_require_physical_capacity() {
         let opts = FileAllocOpts::with_truncate(200);
         assert!(MasterFilesystem::validate_alloc_capacity(20, 2, &opts, 0).is_ok());
+    }
+
+    fn replication_file(fs: &MasterFilesystem, path: &str) -> i64 {
+        for worker_id in [100, 200, 300] {
+            let mut worker = WorkerInfo::default();
+            worker.address.worker_id = worker_id;
+            fs.add_test_worker(worker);
+        }
+        let opts = CreateFileOptsBuilder::new()
+            .create_parent(true)
+            .replicas(2)
+            .build();
+        fs.create_with_opts(path, opts, OpenFlags::new_create())
+            .unwrap();
+        let block = fs
+            .add_block(
+                path,
+                None,
+                ClientAddress::default(),
+                vec![],
+                vec![],
+                0,
+                None,
+            )
+            .unwrap();
+        let block_id = block.block.id;
+        fs.fs_dir
+            .write()
+            .add_block_location(block_id, BlockLocation::with_id(100))
+            .unwrap();
+        block_id
+    }
+
+    #[test]
+    fn replication_state_rejects_deleted_block() {
+        let fs = test_fs("replication-state-deleted");
+        let path = "/replication-state-deleted.log";
+        let block_id = replication_file(&fs, path);
+        assert!(fs
+            .fs_dir
+            .read()
+            .replication_block_state(block_id)
+            .unwrap()
+            .is_some());
+
+        fs.delete(path, false).unwrap();
+        let mut fs_dir = fs.fs_dir.write();
+        assert!(fs_dir.replication_block_state(block_id).unwrap().is_none());
+        assert!(!fs_dir
+            .add_replication_location_if_needed(block_id, BlockLocation::with_id(200))
+            .unwrap());
+    }
+
+    #[test]
+    fn replication_state_rejects_overwritten_block() {
+        let fs = test_fs("replication-state-overwritten");
+        let path = "/replication-state-overwritten.log";
+        let old_block_id = replication_file(&fs, path);
+
+        let opts = CreateFileOptsBuilder::new()
+            .create_parent(true)
+            .replicas(2)
+            .build();
+        fs.create_with_opts(path, opts, OpenFlags::new_create().set_overwrite(true))
+            .unwrap();
+
+        let mut fs_dir = fs.fs_dir.write();
+        assert!(fs_dir
+            .replication_block_state(old_block_id)
+            .unwrap()
+            .is_none());
+        assert!(!fs_dir
+            .add_replication_location_if_needed(old_block_id, BlockLocation::with_id(200))
+            .unwrap());
+    }
+
+    #[test]
+    fn replication_location_update_is_idempotent_and_respects_replica_count() {
+        let fs = test_fs("replication-location-guard");
+        let block_id = replication_file(&fs, "/replication-location-guard.log");
+        let mut fs_dir = fs.fs_dir.write();
+
+        assert!(fs_dir
+            .add_replication_location_if_needed(block_id, BlockLocation::with_id(200))
+            .unwrap());
+        assert!(
+            !fs_dir
+                .add_replication_location_if_needed(
+                    block_id,
+                    BlockLocation::new(200, StorageType::Ssd),
+                )
+                .unwrap()
+        );
+        assert!(!fs_dir
+            .add_replication_location_if_needed(block_id, BlockLocation::with_id(300))
+            .unwrap());
+
+        let state = fs_dir.replication_block_state(block_id).unwrap().unwrap();
+        assert_eq!(state.replicas, 2);
+        assert_eq!(state.locations.len(), 2);
+        assert_eq!(
+            state
+                .locations
+                .iter()
+                .map(|location| location.worker_id)
+                .collect::<Vec<_>>(),
+            vec![100, 200]
+        );
     }
 
     #[test]

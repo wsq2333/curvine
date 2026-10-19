@@ -17,6 +17,7 @@
 use crate::conf::{JournalConf, JournalConfExt};
 use crate::proto::raft::*;
 use crate::raft::raft_error::RaftError;
+use crate::raft::recovery::{PeerSessions, Recovery, SessionEvent};
 use crate::raft::storage::{AppStorage, ApplyMsg, LogStorage, PeerStorage};
 use crate::raft::*;
 use crate::utils::SerdeUtils;
@@ -25,14 +26,14 @@ use curvine_io::DataSlice;
 use curvine_net::net::InetAddr;
 use curvine_rpc::client::dispatch::{Callback, Envelope};
 use curvine_rpc::message::{Builder, RefMessage, ResponseStatus};
-use curvine_runtime::common::{DurationUnit, LocalTime, TimeSpent};
+use curvine_runtime::common::{DurationUnit, LocalTime, TimeSpent, Utils};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use curvine_runtime::sync::channel::{CallChannel, CallReceiver};
 use log::{debug, error, info, warn};
 use prost::Message as PMessage;
 use raft::eraftpb::{ConfChange, Entry, EntryType, MessageType, Snapshot};
 use raft::prelude::ConfChangeType;
-use raft::{RawNode, SoftState};
+use raft::{RawNode, Ready, SoftState};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,6 +43,11 @@ use tokio::time::{interval, MissedTickBehavior};
 struct ProposeApply {
     response: ProposeResponse,
     apply_done: Option<CallReceiver<RaftResult<()>>>,
+}
+
+struct PendingReady {
+    ready: Ready,
+    soft_state: Option<SoftState>,
 }
 
 pub struct RaftNode<A, B>
@@ -55,6 +61,15 @@ where
     raw: RawNode<PeerStorage<A, B>>,
 
     client: RaftClient,
+
+    session: u64,
+    peer_sessions: PeerSessions,
+    heartbeat_sequence: u64,
+    session_sender: mpsc::UnboundedSender<SessionEvent>,
+    session_receiver: mpsc::UnboundedReceiver<SessionEvent>,
+    recovery: Recovery,
+    pending_ready: Option<PendingReady>,
+    snapshot_done: Option<tokio::sync::oneshot::Receiver<RaftResult<()>>>,
 
     storage: PeerStorage<A, B>,
 
@@ -73,6 +88,8 @@ where
     max_batch_size: usize,
 
     snapshot_interval_ms: u64,
+
+    snapshot_min_interval_ms: u64,
 
     snapshot_entries: u64,
 
@@ -99,6 +116,7 @@ where
     ) -> RaftResult<Self> {
         let group = RaftGroup::from_conf(conf);
         let id = group.get_node_id(&conf.local_addr())?;
+        let recovery = Recovery::load(conf, id)?;
 
         let client = RaftClient::new(rt.clone(), &group, conf.new_client_conf());
         let snapshot_interval_ms = DurationUnit::from_str(&conf.snapshot_interval)
@@ -108,18 +126,27 @@ where
         let tick_interval = Duration::from_millis(conf.raft_tick_interval_ms);
         let max_batch_size = conf.raft_batch_size.max(1);
 
-        let last_applied = Self::install_snapshot(&log_store, &app_store, group.voters()).await?;
+        let storage = PeerStorage::new(rt.clone(), id, log_store, app_store, client.clone(), conf);
+        let last_applied = Self::install_snapshot(&storage, group.voters()).await?;
         let config = conf.new_raft_conf(id, last_applied);
         config.validate()?;
 
-        let storage = PeerStorage::new(rt.clone(), log_store, app_store, client.clone(), conf);
         let raw = RawNode::new(&config, storage.clone(), logger)?;
+        let (session_sender, session_receiver) = mpsc::unbounded_channel();
         // raw.raft.become_candidate();
 
         let node = Self {
             rt,
             raw,
             client,
+            session: Utils::rand_id(),
+            peer_sessions: PeerSessions::default(),
+            heartbeat_sequence: 0,
+            session_sender,
+            session_receiver,
+            recovery,
+            pending_ready: None,
+            snapshot_done: None,
             storage,
             receiver,
             sender,
@@ -128,6 +155,7 @@ where
             tick_interval,
             max_batch_size,
             snapshot_interval_ms,
+            snapshot_min_interval_ms: conf.snapshot_min_interval.as_millis(),
             snapshot_entries,
             last_snapshot_ms: LocalTime::mills(),
             last_snapshot_op_id: 0,
@@ -149,6 +177,7 @@ where
     ) -> RaftResult<Self> {
         let group = RaftGroup::from_conf(conf);
         let id = group.get_node_id(&conf.local_addr())?;
+        let recovery = Recovery::load(conf, id)?;
         let client = RaftClient::new(rt.clone(), &group, conf.new_client_conf());
         let snapshot_interval_ms = DurationUnit::from_str(&conf.snapshot_interval)
             .unwrap()
@@ -162,12 +191,21 @@ where
         config.validate()?;
 
         client.join_cluster(id, &conf.local_addr()).await?;
-        let storage = PeerStorage::new(rt.clone(), log_store, app_store, client.clone(), conf);
+        let storage = PeerStorage::new(rt.clone(), id, log_store, app_store, client.clone(), conf);
         let raw = RawNode::new(&config, storage.clone(), logger)?;
+        let (session_sender, session_receiver) = mpsc::unbounded_channel();
         let node = Self {
             rt,
             raw,
             client,
+            session: Utils::rand_id(),
+            peer_sessions: PeerSessions::default(),
+            heartbeat_sequence: 0,
+            session_sender,
+            session_receiver,
+            recovery,
+            pending_ready: None,
+            snapshot_done: None,
             storage,
             receiver,
             sender,
@@ -176,6 +214,7 @@ where
             tick_interval,
             max_batch_size,
             snapshot_interval_ms,
+            snapshot_min_interval_ms: conf.snapshot_min_interval.as_millis(),
             snapshot_entries,
             last_snapshot_ms: LocalTime::mills(),
             last_snapshot_op_id: 0,
@@ -185,28 +224,24 @@ where
     }
 
     // Check whether recovery from snapshot is required.
-    pub async fn install_snapshot(
-        log_store: &A,
-        app_store: &B,
-        voters: Vec<u64>,
-    ) -> RaftResult<u64> {
-        info!("init raft state: {:?}", log_store.initial_state()?);
+    pub async fn install_snapshot(ps: &PeerStorage<A, B>, voters: Vec<u64>) -> RaftResult<u64> {
+        info!("init raft state: {:?}", ps.log_store.initial_state()?);
 
         let spend = TimeSpent::new();
 
-        match log_store.latest_snapshot()? {
+        match ps.log_store.latest_snapshot()? {
             None => {
-                let fsm_state = app_store.get_fsm_state();
+                let fsm_state = ps.app_store.get_fsm_state();
                 let mut snapshot = Snapshot::default();
                 snapshot.mut_metadata().mut_conf_state().voters = voters;
 
-                log_store.apply_snapshot(snapshot.clone())?;
+                ps.log_store.apply_snapshot(snapshot.clone())?;
                 // A leader that steps down before the first raft snapshot is
                 // persisted already has the correct local metadata. Installing
                 // an empty application snapshot would wipe populated state and
                 // is refused by journal_loader (#1207, #1268).
                 if fsm_state.applied.index == 0 {
-                    app_store.apply_snapshot(SnapshotData::default()).await?;
+                    ps.app_store.apply_snapshot(SnapshotData::default()).await?;
                 } else {
                     info!(
                         "skip empty snapshot install; preserving local state at applied index {}",
@@ -217,28 +252,40 @@ where
 
             Some(mut snapshot) => {
                 snapshot.mut_metadata().mut_conf_state().voters = voters;
-                // log store application snapshot.
-                log_store.apply_snapshot(snapshot.clone())?;
                 // app store app snapshot.
-                let snapshot_data: SnapshotData = SnapshotData::decode(snapshot.get_data())?;
+                let mut data: SnapshotData = SnapshotData::decode(snapshot.get_data())?;
 
                 info!(
-                    "install snapshot start, dir: {}, fsm_state {:?}",
-                    snapshot_data.data_dir(),
-                    snapshot_data.fsm_state
+                    "install snapshot start, node id: {}, node addr {}, dir: {}, fsm_state {:?}",
+                    data.node_id,
+                    ps.client.get_addr_string(data.node_id),
+                    data.data_dir(),
+                    data.fsm_state
                 );
 
-                app_store.apply_snapshot(snapshot_data).await?;
+                // The persisted snapshot may reference another member's files
+                // (e.g. a follower snapshot the leader only registered). Fetch it
+                // locally first, then record this member as the owner so a later
+                // restart does not re-download and this member can serve its own
+                // copy if it becomes leader.
+                let fetcher = ps.create_fetcher(data)?;
+                data = fetcher.fetch().await?;
+                data.node_id = ps.id;
+
+                // log store application snapshot.
+                snapshot.data = data.encode_to_vec();
+                ps.log_store.apply_snapshot(snapshot.clone())?;
+                ps.app_store.apply_snapshot(data).await?;
 
                 info!("install snapshot end, cost {} ms", spend.used_ms());
             }
         };
 
-        let fsm_state = app_store.get_fsm_state();
-        app_store
+        let fsm_state = ps.app_store.get_fsm_state();
+        ps.app_store
             .apply(true, ApplyMsg::new_scan(fsm_state.applied))
             .await?;
-        Ok(app_store.get_fsm_state().applied.index)
+        Ok(ps.get_fsm_state().applied.index)
     }
 
     pub fn is_leader(&self) -> bool {
@@ -282,26 +329,103 @@ where
             tokio::select! {
                 biased;
 
+                result = Self::wait_snapshot_completion(&mut self.snapshot_done) => {
+                    self.snapshot_done = None;
+                    let result = result.map_err(|_| RaftError::other(
+                        "snapshot application completion sender dropped".into()
+                    ))?;
+                    self.complete_pending_snapshot(result, &mut promise).await?;
+                }
+
                 _ = ticker.tick() => {
-                    self.raw.tick();
+                    if self.pending_ready.is_none() && !self.recovery.active {
+                        self.raw.tick();
+                    }
+                }
+
+                Some(event) = self.session_receiver.recv() => {
+                    if self.pending_ready.is_none() {
+                        self.peer_sessions.observe(&mut self.raw, event);
+                    }
                 }
 
                 result = self.receiver.recv() => {
                     let Some(env) = result else { break };
-                    self.handle(env, &mut promise)?;
+                    self.handle_available(env, &mut promise)?;
 
                     for _ in 1..self.max_batch_size {
                         let Ok(env) = self.receiver.try_recv() else { break };
-                        self.handle(env, &mut promise)?;
+                        self.handle_available(env, &mut promise)?;
                     }
                 }
             }
 
-            // The raft state processing failed and the node directly reported an error.
             self.on_ready(&mut promise).await?;
+            if self.recovery.active
+                && self.pending_ready.is_none()
+                && !self.storage.is_snapshot_applying()
+                && self.recovery.finish(
+                    &self.raw,
+                    self.storage.log_store.initial_state()?.hard_state.commit,
+                    self.storage.get_fsm_state().applied.index,
+                )?
+            {
+                info!(
+                    "member recovery completed, raft_id {}, term {}, applied {}",
+                    self.id(),
+                    self.raw.raft.term,
+                    self.storage.get_fsm_state().applied.index
+                );
+                self.role_monitor.advance_role(&SoftState {
+                    leader_id: self.leader(),
+                    raft_state: self.raw.raft.state,
+                });
+            }
         }
 
         Ok(())
+    }
+
+    async fn wait_snapshot_completion(
+        receiver: &mut Option<tokio::sync::oneshot::Receiver<RaftResult<()>>>,
+    ) -> Result<RaftResult<()>, tokio::sync::oneshot::error::RecvError> {
+        match receiver {
+            Some(receiver) => receiver.await,
+            None => std::future::pending().await,
+        }
+    }
+
+    async fn complete_pending_snapshot(
+        &mut self,
+        result: RaftResult<()>,
+        promise: &mut HashMap<i64, Callback>,
+    ) -> RaftResult<()> {
+        result?;
+        let pending = self
+            .pending_ready
+            .take()
+            .ok_or_else(|| RaftError::other("snapshot completed without a pending Ready".into()))?;
+        self.finish_ready(pending.ready, pending.soft_state, promise)
+            .await
+    }
+
+    fn handle_available(
+        &mut self,
+        env: Envelope,
+        promise: &mut HashMap<i64, Callback>,
+    ) -> RaftResult<()> {
+        if self.pending_ready.is_none() {
+            return self.handle(env, promise);
+        }
+
+        if RaftCode::from(env.msg.code()) == RaftCode::Ping {
+            self.handle_ping(env)
+        } else {
+            Self::send_request_error(
+                env,
+                RaftError::leader_not_ready().ctx("snapshot application is in progress"),
+            )
+        }
     }
 
     fn send_not_leader(leader_id: u64, env: Envelope, group: &RaftGroup) -> RaftResult<()> {
@@ -372,11 +496,39 @@ where
             Err(e) => return Self::send_malformed_request_error(env, e.into()),
         };
 
-        if let Err(e) = self.raw.step(raft.message) {
-            return Self::send_request_error(env, e.into());
+        let message = &raft.message;
+        if message.to != self.id() || message.from == self.id() || message.from == DEFAULT_LEADER_ID
+        {
+            return Self::send_request_error(
+                env,
+                RaftError::other("invalid Raft peer identity".into()),
+            );
+        }
+        if self.is_leader()
+            && matches!(
+                message.get_msg_type(),
+                MessageType::MsgAppendResponse | MessageType::MsgHeartbeatResponse
+            )
+            && !self
+                .peer_sessions
+                .accepts(message.from, raft.sender_session)
+        {
+            return Self::send_request_error(
+                env,
+                RaftError::other(
+                    "unverified Raft sender session; heartbeat handshake required".into(),
+                ),
+            );
+        }
+        if let Err(e) = self.recovery.step(&mut self.raw, raft, self.session) {
+            return Self::send_request_error(env, e);
         }
         let rep_msg = Builder::success(&env.msg)
-            .proto_header(RaftResponse::default())
+            .proto_header(RaftResponse {
+                session: Some(self.session),
+                term: Some(self.raw.raft.term),
+                recovering: Some(self.recovery.active),
+            })
             .build();
         env.send_with_log(Ok(rep_msg));
         Ok(())
@@ -427,6 +579,32 @@ where
         Ok(())
     }
 
+    fn handle_report_snapshot(&self, env: Envelope) -> RaftResult<()> {
+        let request: ReportSnapshotRequest = match env.msg.parse_header() {
+            Ok(response) => response,
+            Err(e) => return Self::send_malformed_request_error(env, e.into()),
+        };
+
+        if !self.is_leader() {
+            return Self::send_not_leader(self.leader(), env, &self.group);
+        }
+
+        match self.storage.register_snapshot(request.snapshot) {
+            Ok(accepted) => {
+                let msg = Builder::success(&env.msg)
+                    .proto_header(ReportSnapshotResponse { accepted })
+                    .build();
+                env.send_with_log(Ok(msg));
+            }
+            Err(e) => {
+                warn!("report snapshot failed: {}", e);
+                return Self::send_malformed_request_error(env, e);
+            }
+        };
+
+        Ok(())
+    }
+
     fn handle(&mut self, env: Envelope, promise: &mut HashMap<i64, Callback>) -> RaftResult<()> {
         let code = RaftCode::from(env.msg.code());
         //info!("receive: {:?} {:?}", code, env.msg);
@@ -439,6 +617,8 @@ where
 
             RaftCode::Ping => self.handle_ping(env),
 
+            RaftCode::ReportSnapshot => self.handle_report_snapshot(env),
+
             _ => {
                 let ext = env
                     .msg
@@ -450,30 +630,34 @@ where
     }
 
     async fn on_ready(&mut self, promise: &mut HashMap<i64, Callback>) -> RaftResult<()> {
-        // Snapshot is being applied and messages are not processed.
-        if self.storage.is_snapshot_applying() {
+        if self.pending_ready.is_some() || !self.raw.has_ready() {
             return Ok(());
         }
 
-        // Determine whether the raft module has completed processing of the message.
-        if !self.raw.has_ready() {
-            return Ok(());
-        }
-
-        // Get the ready structure.
-        let mut ready = self.raw.ready();
-
+        let ready = self.raw.ready();
         let soft_state = ready.ss().map(|ss| SoftState {
             leader_id: ss.leader_id,
             raft_state: ss.raft_state,
         });
 
-        // Process snapshots.
         if *ready.snapshot() != Snapshot::default() {
-            self.storage
+            let snapshot_done = self
+                .storage
                 .gen_apply_snapshot_job(ready.snapshot().clone())?;
+            self.pending_ready = Some(PendingReady { ready, soft_state });
+            self.snapshot_done = Some(snapshot_done);
+            return Ok(());
         }
 
+        self.finish_ready(ready, soft_state, promise).await
+    }
+
+    async fn finish_ready(
+        &mut self,
+        mut ready: Ready,
+        soft_state: Option<SoftState>,
+        promise: &mut HashMap<i64, Callback>,
+    ) -> RaftResult<()> {
         // Persist entries before the HardState that may commit them. A crash may
         // leave extra uncommitted entries, but must never leave commit past tail.
         if !ready.entries().is_empty() {
@@ -527,15 +711,12 @@ where
             self.storage.role_change(ss.raft_state).await?;
             let to_follower = self.role_monitor.is_leader() && !self.is_leader();
             if to_follower {
-                Self::install_snapshot(
-                    &self.storage.log_store,
-                    &self.storage.app_store,
-                    self.group.voters(),
-                )
-                .await?;
+                Self::install_snapshot(&self.storage, self.group.voters()).await?;
             }
 
-            self.role_monitor.advance_role(&ss);
+            if !self.recovery.active {
+                self.role_monitor.advance_role(&ss);
+            }
         } else {
             // Determine whether a snapshot is needed.
             self.apply_create_snapshot()?;
@@ -551,10 +732,20 @@ where
             let send_msg = Builder::new_rpc(RaftCode::Raft)
                 .proto_header(RaftRequest {
                     message: message.clone(),
+                    sender_session: Some(self.session),
+                    receiver_session: self.peer_sessions.get(to),
+                    leader_commit: self.is_leader().then_some(self.raw.raft.raft_log.committed),
                 })
                 .build();
 
             let client = self.client.clone();
+            let session_sender = self.session_sender.clone();
+            let term = message.term;
+            self.heartbeat_sequence += 1;
+            let heartbeat = self.heartbeat_sequence;
+            let discover = msg_type == MessageType::MsgHeartbeat
+                && self.is_leader()
+                && self.peer_sessions.begin(to, term, heartbeat);
             self.rt.spawn(async move {
                 // Heartbeat and voting messages do not need to be retryed.
                 let res: RaftResult<RaftResponse> = if msg_type == MessageType::MsgHeartbeat
@@ -565,11 +756,19 @@ where
                 } else {
                     client.retry_rpc(to, send_msg).await
                 };
-                if let Err(e) = res {
+                if let Err(e) = &res {
                     warn!(
                         "send message error, to {}, index {}, msg_type {:?}: {}",
                         to, index, msg_type, e
                     );
+                }
+                if discover {
+                    let _ = session_sender.send(SessionEvent {
+                        peer: to,
+                        term,
+                        heartbeat,
+                        response: res.ok(),
+                    });
                 }
             });
         }
@@ -580,10 +779,22 @@ where
     pub fn apply_config_change(&mut self, entry: &Entry) -> RaftResult<ConfChangeResponse> {
         let change: ConfChange = PMessage::decode(entry.get_data())?;
         let id = change.get_node_id();
+        let add_addr = match change.get_change_type() {
+            ConfChangeType::AddNode => {
+                Some(SerdeUtils::deserialize::<InetAddr>(change.get_context())?)
+            }
+            ConfChangeType::RemoveNode => None,
+            _ => unimplemented!(),
+        };
+
+        // Apply and persist Raft membership first. Transport and session state
+        // must not claim a change succeeded when raft-rs rejected it.
+        let cs = self.raw.apply_conf_change(&change)?;
+        self.raw.mut_store().set_conf_state(&cs)?;
 
         match change.get_change_type() {
             ConfChangeType::AddNode => {
-                let addr: InetAddr = SerdeUtils::deserialize(change.get_context())?;
+                let addr = add_addr.unwrap();
                 info!(
                     "Raft adding node: {}({}), current leader: {}({:?})",
                     id,
@@ -591,25 +802,23 @@ where
                     self.leader(),
                     self.group.get_addr(&self.leader())
                 );
-                self.group.insert(id, &addr);
                 self.client.add_node(id, &addr)?;
+                self.group.insert(id, &addr);
             }
 
             ConfChangeType::RemoveNode => {
-                if change.get_node_id() == self.id() {
+                // Membership removal ends the incarnation-fencing lifetime for
+                // this raft ID. A later AddNode with the same ID must negotiate
+                // a fresh session instead of inheriting stale peer state.
+                self.peer_sessions.remove(id);
+                if id == self.id() {
                     self.role_monitor.advance_exit();
                 } else {
                     self.group.remove(&id);
                 }
             }
 
-            _ => unimplemented!(),
-        }
-
-        // When a new node joins, create a snapshot.
-        if let Ok(cs) = self.raw.apply_conf_change(&change) {
-            let store = self.raw.mut_store();
-            store.set_conf_state(&cs)?;
+            _ => unreachable!(),
         }
 
         Ok(ConfChangeResponse::default())
@@ -684,14 +893,21 @@ where
             return Ok(());
         }
 
+        let now = LocalTime::mills();
+        if self.last_snapshot_op_id > 0
+            && now.saturating_sub(self.last_snapshot_ms) < self.snapshot_min_interval_ms
+        {
+            return Ok(());
+        }
+
         let last_op_id = self.storage.get_fsm_state().op_id();
         let diff = last_op_id.saturating_sub(self.last_snapshot_op_id);
-        if (LocalTime::mills() - self.last_snapshot_ms > self.snapshot_interval_ms && diff > 0)
+        if (now.saturating_sub(self.last_snapshot_ms) > self.snapshot_interval_ms && diff > 0)
             || diff > self.snapshot_entries
         {
             self.storage.gen_create_snapshot_job()?;
 
-            self.last_snapshot_ms = LocalTime::mills();
+            self.last_snapshot_ms = now;
             self.last_snapshot_op_id = last_op_id;
         }
 
@@ -795,3 +1011,7 @@ where
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "tests/raft_node_recovery_tests.rs"]
+mod raft_node_recovery_tests;

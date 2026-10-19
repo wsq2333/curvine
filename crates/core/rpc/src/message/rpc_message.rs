@@ -20,6 +20,7 @@ use curvine_runtime::common::Utils;
 use num_enum::{FromPrimitive, IntoPrimitive};
 use prost::Message as PMessage;
 use std::fmt::Debug;
+use std::time::Instant;
 
 /// RPC message communication format
 // Message header fixed byte length
@@ -129,6 +130,12 @@ pub struct RpcMessage {
     pub protocol: Protocol,
     pub header: Option<BytesMut>,
     pub data: DataSlice,
+    /// Receipt time, stamped only by the wire-decode paths
+    /// (`RpcFrame::receive`, `ReadFrame::receive`) for non-heartbeat messages.
+    /// Locally built messages leave it `None`; new read paths must preserve
+    /// this invariant because the queue-delay metric and the audit `queueUs`
+    /// field derive from it.
+    pub time: Option<Instant>,
 }
 
 impl RpcMessage {
@@ -137,6 +144,7 @@ impl RpcMessage {
             protocol,
             header,
             data,
+            time: None,
         }
     }
 
@@ -214,11 +222,7 @@ impl RpcMessage {
             seq_id: self.protocol.seq_id,
         };
 
-        Self {
-            protocol,
-            header,
-            data,
-        }
+        Self::new(protocol, header, data)
     }
 
     pub fn header_len(&self) -> usize {
@@ -368,15 +372,15 @@ impl RpcMessage {
             DataSlice::Empty
         };
 
-        Ok(Self {
-            protocol,
-            header,
-            data,
-        })
+        Ok(Self::new(protocol, header, data))
     }
 
     pub fn into_arc(self) -> BoxMessage {
         BoxMessage::arc(self)
+    }
+
+    pub fn set_time(&mut self) {
+        self.time = Some(Instant::now());
     }
 }
 

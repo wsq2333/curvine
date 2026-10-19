@@ -1,5 +1,5 @@
 use crate::spdk_bdev::SpdkBdev;
-use crate::spdk_env::{QpairPool, SpdkEnv, SpdkEnvState};
+use crate::spdk_env::{QpairPool, QpairReleaseOutcome, SpdkEnv, SpdkEnvState};
 use crate::spdk_ffi;
 use bytes::BytesMut;
 use curvine_io::DataSlice;
@@ -33,14 +33,12 @@ fn test_spdk_conf() -> SpdkConf {
         std::env::var("SPDK_TARGET_NQN").unwrap_or("nqn.2024-01.io.curvine:test".to_string());
     let trtype = std::env::var("SPDK_TRANSPORT_TYPE").unwrap_or("tcp".to_string());
     let iova_mode = std::env::var("SPDK_IOVA_MODE").unwrap_or_else(|_| "va".to_string());
+    let hugepage_mb = std::env::var("SPDK_HUGEPAGE_MB").unwrap_or_else(|_| "256".to_string());
 
     SpdkConf {
         enabled: true,
         app_name: "curvine-test".to_string(),
-        hugepage_mb: std::env::var("SPDK_HUGEPAGE_MB")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(256),
+        hugepage_str: format!("{}MB", hugepage_mb),
         reactor_mask: std::env::var("SPDK_REACTOR_MASK").unwrap_or("0x1".to_string()),
         keep_alive_timeout_ms: 500,
         iova_mode,
@@ -200,6 +198,7 @@ fn spdk_full_lifecycle() {
 
         let p = QpairPool {
             inner: Mutex::new(HashMap::new()),
+            pending_destroy: Mutex::new(HashMap::new()),
             ctrl_state: Mutex::new(HashMap::new()),
             total_active: AtomicUsize::new(0),
             total_limit: AtomicUsize::new(0),
@@ -208,6 +207,7 @@ fn spdk_full_lifecycle() {
             max_per_ctrlr: 2,
             shutdown: AtomicBool::new(false),
             qpair_acquire_timeout: Duration::from_secs(30),
+            test_hooks: Default::default(),
         };
         p.register_limit(ctrlr as usize, 4);
 
@@ -217,11 +217,11 @@ fn spdk_full_lifecycle() {
         let q3 = p.acquire(ctrlr).expect("acquire q3"); // active 2→3
 
         // Release 2 — pool accepts them (0 < max_per_ctrlr=2, then 1 < 2)
-        p.release(ctrlr, q1); // pushes q1, active 3→2
-        p.release(ctrlr, q2); // pushes q2, active 2→1
+        assert_eq!(p.release(ctrlr, q1), QpairReleaseOutcome::Cached); // pushes q1, active 3→2
+        assert_eq!(p.release(ctrlr, q2), QpairReleaseOutcome::Cached); // pushes q2, active 2→1
 
         // Release 3rd — pool full (2 >= max_per_ctrlr=2), frees via FFI
-        p.release(ctrlr, q3); // frees q3 via FFI, active 1→0
+        assert_eq!(p.release(ctrlr, q3), QpairReleaseOutcome::Destroyed); // frees q3 via FFI, active 1→0
 
         // Pool has 2 cached (q3 was freed, not pushed)
         let pool = p.inner.lock().unwrap();
@@ -242,6 +242,7 @@ fn spdk_full_lifecycle() {
 
         let p = Arc::new(QpairPool {
             inner: Mutex::new(HashMap::new()),
+            pending_destroy: Mutex::new(HashMap::new()),
             ctrl_state: Mutex::new(HashMap::new()),
             total_active: AtomicUsize::new(0),
             total_limit: AtomicUsize::new(0),
@@ -250,6 +251,7 @@ fn spdk_full_lifecycle() {
             max_per_ctrlr: 16,
             shutdown: AtomicBool::new(false),
             qpair_acquire_timeout: Duration::from_secs(30),
+            test_hooks: Default::default(),
         });
         p.register_limit(ctrlr as usize, 1);
 
@@ -271,7 +273,7 @@ fn spdk_full_lifecycle() {
         thread::sleep(Duration::from_millis(50));
 
         // Release first qpair -> unblocks the second acquire
-        p.release(ctrlr, q1);
+        assert_eq!(p.release(ctrlr, q1), QpairReleaseOutcome::Cached);
 
         let q2_ptr = handle.join().expect("second acquire thread panicked")
             as *mut spdk_ffi::spdk_nvme_qpair;
@@ -281,7 +283,7 @@ fn spdk_full_lifecycle() {
         assert_eq!(active, 1);
 
         // Release second qpair -> active=0
-        p.release(ctrlr, q2_ptr);
+        assert_eq!(p.release(ctrlr, q2_ptr), QpairReleaseOutcome::Cached);
         let (active, _) = p.controller_stats(ctrlr as usize);
         assert_eq!(active, 0);
 

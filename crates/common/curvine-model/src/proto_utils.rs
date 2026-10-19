@@ -304,6 +304,84 @@ impl ProtoUtils {
         }
     }
 
+    pub fn file_block_details_to_pb(src: FileBlockDetails) -> GetFileBlockDetailsResponse {
+        let blocks = src
+            .blocks
+            .into_iter()
+            .map(|block| FileBlockDetailProto {
+                block_id: block.block_id,
+                block_size: block.len,
+                offset: block.offset,
+                replicas: block
+                    .replicas
+                    .into_iter()
+                    .map(|replica| BlockReplicaDetailProto {
+                        worker_id: replica.worker_id,
+                        storage_type: replica.storage_type.into(),
+                        address: replica.address.as_ref().map(Self::worker_address_to_pb),
+                        state: Some(Self::worker_status_to_pb(replica.state) as i32),
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        GetFileBlockDetailsResponse {
+            status: Self::file_status_to_pb(src.status),
+            blocks,
+        }
+    }
+
+    pub fn file_block_details_from_pb(src: GetFileBlockDetailsResponse) -> FileBlockDetails {
+        let blocks = src
+            .blocks
+            .into_iter()
+            .map(|block| FileBlockDetail {
+                block_id: block.block_id,
+                len: block.block_size,
+                offset: block.offset,
+                replicas: block
+                    .replicas
+                    .into_iter()
+                    .map(|replica| BlockReplicaDetail {
+                        worker_id: replica.worker_id,
+                        storage_type: StorageType::from(replica.storage_type),
+                        address: replica.address.as_ref().map(Self::worker_address_from_pb),
+                        state: Self::worker_status_from_pb(replica.state),
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        FileBlockDetails {
+            status: Self::file_status_from_pb(src.status),
+            blocks,
+        }
+    }
+
+    fn worker_status_to_pb(src: WorkerStatus) -> WorkerStatusProto {
+        match src {
+            WorkerStatus::Unknown => WorkerStatusProto::WorkerStatusUnknown,
+            WorkerStatus::Live => WorkerStatusProto::WorkerStatusLive,
+            WorkerStatus::Blacklist => WorkerStatusProto::WorkerStatusBlacklist,
+            WorkerStatus::Decommission => WorkerStatusProto::WorkerStatusDecommission,
+            WorkerStatus::Lost => WorkerStatusProto::WorkerStatusLost,
+        }
+    }
+
+    fn worker_status_from_pb(src: Option<i32>) -> WorkerStatus {
+        match src.unwrap_or(WorkerStatusProto::WorkerStatusUnknown as i32) {
+            value if value == WorkerStatusProto::WorkerStatusLive as i32 => WorkerStatus::Live,
+            value if value == WorkerStatusProto::WorkerStatusBlacklist as i32 => {
+                WorkerStatus::Blacklist
+            }
+            value if value == WorkerStatusProto::WorkerStatusDecommission as i32 => {
+                WorkerStatus::Decommission
+            }
+            value if value == WorkerStatusProto::WorkerStatusLost as i32 => WorkerStatus::Lost,
+            _ => WorkerStatus::Unknown,
+        }
+    }
+
     pub fn filesystem_info_to_pb(src: FilesystemInfo) -> GetFilesystemInfoResponse {
         let mut pb = GetFilesystemInfoResponse {
             active_master: src.active_master,
@@ -511,6 +589,7 @@ impl ProtoUtils {
             worker_id: list.worker_id,
             full_report: list.full_report,
             total_len: list.total_len,
+            report_id: list.report_id.unwrap_or(0),
             blocks: vec![],
         };
         for block in list.blocks {

@@ -39,7 +39,7 @@ pub trait LogStorage: Storage + Clone + Send + Sync + 'static {
     /// Set the submission index of HardState
     /// When a node receives a committed log index from another node, it updates its own Commit field to ensure that the state of the node is consistent with that of the other nodes
     /// Usually, this is called when processing committed log entries to ensure that the node does not skip uncommitted parts when applying the log
-    fn set_hard_state_commit(&self, commit: u64) -> RaftResult<()>;
+    fn set_hard_state_commit(&self, commit: u64) -> RaftResult<HardState>;
 
     /// Set the configuration status of the node
     /// When nodes in the cluster change (such as adding or deleting nodes), the configuration status needs to be updated.
@@ -47,6 +47,28 @@ pub trait LogStorage: Storage + Clone + Send + Sync + 'static {
 
     /// Create a new snapshot.
     fn create_snapshot(&self, data: SnapshotData) -> RaftResult<()>;
+
+    /// Register a snapshot reported by another node, such as a follower.
+    /// Only a snapshot newer than the currently registered one is accepted;
+    /// stale reports are rejected.
+    fn register_snapshot(&self, data: SnapshotData) -> RaftResult<bool> {
+        match self.latest_snapshot()? {
+            None => {
+                self.create_snapshot(data)?;
+                Ok(true)
+            }
+
+            Some(latest) => {
+                // A stale report must not overwrite the currently registered snapshot.
+                if data.fsm_state.applied.index <= latest.get_metadata().index {
+                    return Ok(false);
+                }
+
+                self.create_snapshot(data)?;
+                Ok(true)
+            }
+        }
+    }
 
     /// The state machine used to apply snapshots to nodes.
     /// When the node needs to restore state from the snapshot, it calls this method.
