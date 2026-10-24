@@ -22,6 +22,13 @@ use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct CapacityEntry {
+    pub(crate) op_id: u64,
+    pub(crate) rpc_id: i64,
+    pub(crate) updates: Vec<crate::master::quota::capacity_manager::CapacityUpdate>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct MkdirEntry {
     pub(crate) op_id: u64,
     pub(crate) rpc_id: i64,
@@ -206,6 +213,7 @@ pub enum JournalEntry {
     Snapshot(SnapshotEntry),
     // Keep new variants appended so existing journal discriminants remain stable.
     CacheInvalidation(CacheInvalidationEntry),
+    Capacity(CapacityEntry),
 }
 
 impl JournalEntry {
@@ -229,6 +237,7 @@ impl JournalEntry {
             JournalEntry::CacheInvalidation(e) => e.op_id,
             JournalEntry::UfsApplied(e) => e.op_id,
             JournalEntry::Snapshot(e) => e.op_id,
+            JournalEntry::Capacity(e) => e.op_id,
         }
     }
 
@@ -252,6 +261,7 @@ impl JournalEntry {
             JournalEntry::CacheInvalidation(e) => e.rpc_id,
             JournalEntry::UfsApplied(e) => e.rpc_id,
             JournalEntry::Snapshot(e) => e.rpc_id,
+            JournalEntry::Capacity(e) => e.rpc_id,
         }
     }
 

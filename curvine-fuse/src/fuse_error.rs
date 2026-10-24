@@ -124,6 +124,7 @@ pub(crate) fn errno_of(value: &FsError) -> i32 {
         FsError::InvalidFileSize(_) => Some(libc::EFBIG),
         FsError::InvalidArgument(_) => Some(libc::EINVAL),
         FsError::DiskOutOfSpace(_) => Some(libc::ENOSPC),
+        FsError::QuotaExceeded(_) => Some(libc::EDQUOT),
         FsError::Timeout(_) => Some(libc::ETIMEDOUT),
         FsError::Unsupported(_) => Some(libc::ENOSYS),
         FsError::InProgress(_) => Some(libc::EBUSY),
@@ -181,6 +182,7 @@ pub(crate) fn errno_label(errno: i32) -> &'static str {
         libc::ENOTEMPTY => "ENOTEMPTY",
         libc::ETIMEDOUT => "ETIMEDOUT",
         libc::ENOSPC => "ENOSPC",
+        libc::EDQUOT => "EDQUOT",
         libc::ETXTBSY => "ETXTBSY",
         libc::EPROTO => "EPROTO",
         libc::ERANGE => "ERANGE",
@@ -250,6 +252,13 @@ mod tests {
         let err: FuseError = FsError::disk_out_of_space("strict free_ratio floor").into();
         assert_eq!(err.errno, libc::ENOSPC);
         assert_eq!(errno_label(err.errno), "ENOSPC");
+    }
+
+    #[test]
+    fn quota_exceeded_maps_to_edquot() {
+        let err: FuseError = FsError::quota_exceeded("/checkpoints is full").into();
+        assert_eq!(err.errno, libc::EDQUOT);
+        assert_eq!(errno_label(err.errno), "EDQUOT");
     }
 
     #[test]

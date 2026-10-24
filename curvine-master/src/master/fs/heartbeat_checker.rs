@@ -62,6 +62,7 @@ impl LoopTask for HeartbeatChecker {
         if !self.monitor.is_active() {
             return Ok(());
         }
+        self.fs.reconcile_capacity_deletes()?;
 
         let mut blacklisted_workers = Vec::new();
         let mut removed_workers = Vec::new();

@@ -259,6 +259,12 @@ async fn workers1(
     Ok(Json(wm.worker_list()))
 }
 
+async fn directory_capacity(
+    Extension(instance): Extension<Arc<MasterRouterHandler>>,
+) -> FsResult<Json<Vec<crate::master::quota::capacity_manager::DirectoryCapacityUsage>>> {
+    Ok(Json(instance.fs.directory_capacity_usage()?))
+}
+
 impl RouterHandler for MasterRouterHandler {
     fn router(&self) -> Router {
         let instance = Arc::new(self.clone());
@@ -267,6 +273,7 @@ impl RouterHandler for MasterRouterHandler {
             .route("/metrics", get(metrics))
             .route("/report", get(report))
             .route("/api/overview", get(overview))
+            .route("/api/capacity", get(directory_capacity))
             .route("/api/config", get(|| async { Json(conf) }))
             .route("/api/browse", get(browse))
             .route("/api/block_locations", get(block_locations))

@@ -15,4 +15,8 @@
 mod quota_manager;
 pub use quota_manager::QuotaManager;
 
+mod capacity_fs;
+pub mod capacity_manager;
+#[cfg(test)]
+mod capacity_tests;
 pub mod eviction;

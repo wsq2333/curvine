@@ -23,6 +23,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MasterConf {
+    pub capacity: crate::CapacityConf,
     pub hostname: String,
     pub rpc_port: u16,
     pub web_port: u16,
@@ -156,6 +157,12 @@ impl MasterConf {
     pub const DEFAULT_BLOCK_REPORT_LIMIT: usize = 100_000;
 
     pub fn init(&mut self) -> CommonResult<()> {
+        self.capacity.validate()?;
+        if self.capacity.enabled() && self.enable_quota_eviction {
+            return err_box!(
+                "directory capacity management cannot be combined with global quota eviction"
+            );
+        }
         self.heartbeat_interval_unit = DurationUnit::from_str(&self.heartbeat_interval)?;
 
         self.worker_check_interval_unit = DurationUnit::from_str(&self.worker_check_interval)?;
@@ -288,6 +295,7 @@ impl Default for MasterConf {
         let rocksdb = Self::rocksdb_default().set_dir(&dir);
 
         let mut conf = Self {
+            capacity: Default::default(),
             hostname: ClusterConf::DEFAULT_HOSTNAME.to_string(),
             rpc_port: ClusterConf::DEFAULT_MASTER_PORT,
             web_port: ClusterConf::DEFAULT_MASTER_WEB_PORT,

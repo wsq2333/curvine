@@ -28,6 +28,9 @@ pub use self::journal_conf::JournalConf;
 mod master_conf;
 pub use self::master_conf::MasterConf;
 
+mod capacity_conf;
+pub use capacity_conf::{contains_path, CapacityConf, CapacityOverflow, DirectoryCapacityConf};
+
 mod mds_conf;
 pub use self::mds_conf::{KvBackendType, MdsConf};
 

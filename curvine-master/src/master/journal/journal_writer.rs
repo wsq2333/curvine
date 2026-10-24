@@ -46,6 +46,20 @@ pub struct JournalWriter {
 }
 
 impl JournalWriter {
+    pub(crate) fn log_capacity(
+        &self,
+        fs_dir: &FsDir,
+        updates: Vec<crate::master::quota::capacity_manager::CapacityUpdate>,
+    ) -> FsResult<()> {
+        self.send(
+            fs_dir,
+            JournalEntry::Capacity(CapacityEntry {
+                op_id: fs_dir.next_op_id(),
+                rpc_id: 0,
+                updates,
+            }),
+        )
+    }
     pub fn new(testing: bool, client: RaftClient, conf: &JournalConf) -> FsResult<Self> {
         let node_id = conf.node_id()?;
         let metrics = Master::get_metrics()?;

@@ -40,6 +40,9 @@ const MODE_SETGID: u32 = 0o2000;
 
 /// Note: The modification operation uses &mut self, which is a necessary improvement. We use the unsafe API to perform modifications.
 pub struct FsDir {
+    pub(crate) capacity_conf: curvine_config::CapacityConf,
+    pub(crate) capacity: crate::master::quota::capacity_manager::CapacityManager,
+    pub(crate) capacity_scanned: bool,
     pub(crate) root_dir: InodeView,
     pub(crate) inode_id: InodeId,
     pub(crate) store: InodeStore,
@@ -88,7 +91,10 @@ impl FsDir {
         let state = InodeStore::new(store, ttl_bucket_list)?;
         let (last_inode_id, root_dir) = state.create_blank_tree()?;
 
-        let fs_dir = Self {
+        let mut fs_dir = Self {
+            capacity_conf: conf.master.capacity.clone(),
+            capacity: Default::default(),
+            capacity_scanned: false,
             root_dir,
             inode_id: InodeId::new(),
             store: state,
@@ -97,6 +103,7 @@ impl FsDir {
             op_id: AtomicCounter::new(0),
         };
         fs_dir.update_last_inode_id(last_inode_id)?;
+        fs_dir.reload_capacity()?;
 
         Ok(fs_dir)
     }
@@ -262,6 +269,17 @@ impl FsDir {
 
     // Delete files or directories
     pub fn delete(&mut self, inp: &InodePath, recursive: bool) -> FsResult<DeleteResult> {
+        self.prepare_capacity()?;
+        if self
+            .capacity_conf
+            .directories
+            .iter()
+            .any(|d| curvine_config::contains_path(inp.path(), &d.path))
+        {
+            return err_ext!(FsError::invalid_argument(
+                "cannot delete a configured capacity root or ancestor"
+            ));
+        }
         let op_ms = LocalTime::mills();
 
         if inp.is_root() {
@@ -276,10 +294,13 @@ impl FsDir {
             return err_ext!(FsError::dir_not_empty(inp.path()));
         }
 
+        let capacity_blocks = self.capacity_subtree_blocks(inp);
         let del_res = self.unprotected_delete(inp, op_ms as i64)?;
         self.journal_writer
             .log_delete(self, inp.path(), op_ms as i64)?;
 
+        self.capacity_deleting(&del_res)?;
+        self.capacity_retire_missing(&capacity_blocks)?;
         Ok(del_res)
     }
 
@@ -780,7 +801,10 @@ impl FsDir {
         choose_workers: &[WorkerAddress],
         file_len: i64,
     ) -> FsResult<ExtendedBlock> {
-        let file = inode.as_file_mut()?;
+        // Validate the previous block commits before publishing mutations. A
+        // failed allocation must not leave a changed length/sequence in memory.
+        let mut updated = inode.as_file_ref()?.clone();
+        let file = &mut updated;
 
         let new_block_id = file.next_block_id()?;
 
@@ -799,6 +823,7 @@ impl FsDir {
         };
 
         // state add block.
+        *inode.as_file_mut()? = updated;
         self.store.apply_new_block(inode.as_ref(), &commit_blocks)?;
         self.journal_writer
             .log_add_block(self, path, inode.as_file_ref()?, commit_blocks)?;
@@ -844,6 +869,7 @@ impl FsDir {
     ) -> FsResult<HashMap<i64, Vec<BlockLocation>>> {
         let locs = self.store.get_file_locations(file)?;
         self.evictor.on_access(file.id());
+        self.capacity.touch(file.id());
         Ok(locs)
     }
 
@@ -1025,6 +1051,7 @@ impl FsDir {
         let (last_inode_id, root_dir) = self.store.create_tree()?;
         self.root_dir = root_dir;
         self.update_last_inode_id(last_inode_id)?;
+        self.reload_capacity()?;
         Ok(())
     }
 
@@ -1048,6 +1075,7 @@ impl FsDir {
         let (last_inode_id, root_dir) = self.store.create_tree()?;
         self.root_dir = root_dir;
         self.update_last_inode_id(last_inode_id)?;
+        self.reload_capacity()?;
         let time2 = spend.used_ms();
 
         info!(
@@ -1068,6 +1096,8 @@ impl FsDir {
     }
 
     pub fn block_report(&mut self, blocks: Vec<(bool, i64, BlockLocation)>) -> FsResult<()> {
+        self.prepare_capacity()?;
+        let capacity_updates = self.capacity_observe(&blocks)?;
         let mut batch = self.store.new_batch();
         for (add, id, loc) in blocks {
             if add {
@@ -1078,6 +1108,7 @@ impl FsDir {
         }
 
         batch.commit()?;
+        self.record_capacity(capacity_updates)?;
         Ok(())
     }
 
@@ -1100,6 +1131,7 @@ impl FsDir {
         &mut self,
         block_ids: &[i64],
     ) -> FsResult<CacheInvalidationResult> {
+        self.prepare_capacity()?;
         let inode_ids: HashSet<_> = block_ids.iter().map(|id| InodeId::get_id(*id)).collect();
         let mut result = CacheInvalidationResult::default();
         let mut changed_inodes = Vec::new();
@@ -1147,6 +1179,14 @@ impl FsDir {
         self.store.apply_cache_invalidations(changed_inodes)?;
         self.journal_writer
             .log_cache_invalidations(self, journal_inodes)?;
+        self.capacity_deleting(&result.delete_result)?;
+        self.capacity_retire_missing(
+            &result
+                .invalidated_block_ids
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+        )?;
         Ok(result)
     }
 

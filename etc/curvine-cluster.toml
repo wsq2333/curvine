@@ -51,6 +51,9 @@ allow_stale_cache = true
 
 # master configuration
 [master]
+# Optional directory capacity budgets: see curvine-master/docs/directory-capacity.md.
+# Disabled by default. Configure [master.capacity] and its directories tables
+# separately; do not enable global quota eviction at the same time.
 meta_dir = "testing/meta"
 # Worker selection policy: local, robin, random, load_based, or weighted.
 # local prefers a local worker for the first replica and assigns the rest via the weighted policy.

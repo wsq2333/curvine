@@ -36,6 +36,37 @@ impl RocksInodeStore {
 
     pub const PREFIX_MOUNT: u8 = 0x01;
     pub const PREFIX_LOCK: u8 = 0x02;
+    pub const PREFIX_CAPACITY: u8 = 0x03;
+
+    pub(crate) fn capacity_charges(
+        &self,
+    ) -> CommonResult<Vec<crate::master::quota::capacity_manager::CapacityCharge>> {
+        let mut records = Vec::new();
+        for item in self
+            .db
+            .prefix_scan(Self::CF_COMMON, [Self::PREFIX_CAPACITY])?
+        {
+            records.push(Serde::deserialize(&item?.1)?);
+        }
+        Ok(records)
+    }
+
+    pub(crate) fn apply_capacity(
+        &self,
+        updates: &[crate::master::quota::capacity_manager::CapacityUpdate],
+    ) -> CommonResult<()> {
+        let mut batch = self.new_batch();
+        for u in updates {
+            let mut key = vec![Self::PREFIX_CAPACITY];
+            key.extend_from_slice(&u.block_id.to_be_bytes());
+            if let Some(c) = &u.charge {
+                batch.put_cf(Self::CF_COMMON, key, Serde::serialize(c)?)?;
+            } else {
+                batch.delete_cf(Self::CF_COMMON, key)?;
+            }
+        }
+        batch.commit()
+    }
 
     pub fn new(conf: DBConf, format: bool) -> CommonResult<Self> {
         let conf = conf

@@ -112,6 +112,142 @@ const FULL_BLOCK_RECONCILE_THREADS: usize = 2;
 const FULL_BLOCK_RECONCILE_QUEUE_SIZE: usize = 128;
 
 impl MasterFilesystem {
+    /// Only evict Curvine cache copies from this domain. Do not call the unified
+    /// delete path (which could delete the authoritative UFS object).
+    fn capacity_check_admission(
+        &self,
+        fs_dir: &mut FsDir,
+        updates: Vec<crate::master::quota::capacity_manager::CapacityUpdate>,
+    ) -> FsResult<()> {
+        use crate::master::quota::capacity_manager::CapacityManager;
+        if updates.is_empty() {
+            return Ok(());
+        }
+        if let Err(error) = fs_dir.capacity.check(&fs_dir.capacity_conf, &updates) {
+            let protected: HashSet<_> = updates
+                .iter()
+                .filter_map(|u| u.charge.as_ref().map(|c| c.inode_id))
+                .collect();
+            let directories: HashSet<_> = updates
+                .iter()
+                .filter_map(|u| u.charge.as_ref().map(|c| c.directory.clone()))
+                .collect();
+            let mounts = fs_dir.store.store.get_mount_table()?;
+            for directory in directories {
+                let mut to_free =
+                    fs_dir
+                        .capacity
+                        .eviction_bytes(&fs_dir.capacity_conf, &directory, &updates)?;
+                for id in fs_dir.capacity.victims(&directory).into_iter().take(256) {
+                    if to_free == 0 {
+                        break;
+                    }
+                    if protected.contains(&id) {
+                        continue;
+                    }
+                    let Some(InodeView::File(file)) = fs_dir.store.get_inode(id, None)? else {
+                        continue;
+                    };
+                    if !file.is_complete() || !file.storage_policy.both_exists() || file.nlink > 1 {
+                        continue;
+                    }
+                    let path = fs_dir.get_inode_path(id)?;
+                    if CapacityManager::directory(&fs_dir.capacity_conf, &path)?
+                        != Some(directory.as_str())
+                    {
+                        continue;
+                    }
+                    let mount = mounts
+                        .iter()
+                        .filter(|m| curvine_config::contains_path(&m.cv_path, &path))
+                        .max_by_key(|m| m.cv_path.len());
+                    if !mount.is_some_and(|m| m.is_cache_mode()) {
+                        continue;
+                    }
+                    let bytes: u64 = fs_dir
+                        .capacity
+                        .charges
+                        .values()
+                        .filter(|c| c.inode_id == id && !c.deleting)
+                        .map(|c| c.total())
+                        .sum();
+                    let inp = Self::resolve_path(fs_dir, &path)?;
+                    let deleted = fs_dir.delete(&inp, false)?;
+                    self.worker_manager.write().remove_blocks(&deleted);
+                    to_free = to_free.saturating_sub(bytes);
+                }
+            }
+            // Pending deletes remain charged. Let the caller retry after worker
+            // acknowledgements; never wait for network IO holding the namespace lock.
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn capacity_admit(
+        &self,
+        fs_dir: &mut FsDir,
+        updates: Vec<crate::master::quota::capacity_manager::CapacityUpdate>,
+    ) -> FsResult<()> {
+        self.capacity_check_admission(fs_dir, updates.clone())?;
+        fs_dir.record_capacity(updates)
+    }
+
+    pub fn directory_capacity_usage(
+        &self,
+    ) -> FsResult<Vec<crate::master::quota::capacity_manager::DirectoryCapacityUsage>> {
+        let fs = self.fs_dir.read();
+        fs.capacity.snapshots(&fs.capacity_conf)
+    }
+
+    /// Re-enqueue durable pending deletes, including after master failover.
+    pub fn reconcile_capacity_deletes(&self) -> FsResult<()> {
+        if !self.conf.capacity.enabled() {
+            return Ok(());
+        }
+        let mut fs = self.fs_dir.write();
+        fs.prepare_capacity()?;
+        let mut wm = self.worker_manager.write();
+        for (block, workers) in fs.capacity_pending_deletes() {
+            for worker in workers {
+                wm.remove_block(worker, block);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reserve_replica_capacity(&self, block: i64, worker: u32) -> FsResult<()> {
+        let mut fs = self.fs_dir.write();
+        fs.prepare_capacity()?;
+        let Some(mut charge) = fs.capacity.charges.get(&block).cloned() else {
+            return Ok(());
+        };
+        if charge.deleting {
+            return Err(FsError::quota_exceeded("cannot replicate a deleting block"));
+        }
+        if !charge.workers.insert(worker) {
+            return Ok(());
+        }
+        let wm = self.worker_manager.read();
+        let fixed_extent = wm
+            .get_worker(worker)
+            .is_some_and(|w| wm.workers_have_spdk(std::slice::from_ref(&w.address)));
+        drop(wm);
+        if fixed_extent {
+            if let Some(InodeView::File(file)) = fs.store.get_inode(charge.inode_id, None)? {
+                charge.allocation_floor = file.block_size as u64;
+                charge.bytes = charge.bytes.max(charge.allocation_floor);
+            }
+        }
+        // Retain unknown/offline old copies in the charge: a timeout is not a
+        // deletion acknowledgement. The same target's retry is idempotent.
+        self.capacity_admit(
+            &mut fs,
+            vec![crate::master::quota::capacity_manager::CapacityUpdate::put(
+                charge,
+            )],
+        )
+    }
     // Max block-report location updates applied under a single fs_dir write lock.
     const BLOCK_REPORT_WRITE_CHUNK: usize = 4096;
     // Max lost-worker block ids inspected under a single fs_dir write lock.
@@ -263,7 +399,15 @@ impl MasterFilesystem {
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
 
+        fs_dir.prepare_capacity()?;
+        let capacity_blocks = fs_dir.capacity_subtree_blocks(&inp);
         let mut free_res = fs_dir.free(&inp, recursive)?;
+        fs_dir.capacity_deleting(&DeleteResult {
+            inodes: 0,
+            bytes: 0,
+            blocks: free_res.blocks.clone(),
+        })?;
+        fs_dir.capacity_retire_missing(&capacity_blocks)?;
         drop(fs_dir);
 
         let mut worker_manager = self.worker_manager.write();
@@ -281,6 +425,8 @@ impl MasterFilesystem {
         let dst = dst.as_ref();
 
         let mut fs_dir = self.fs_dir.write();
+        fs_dir.prepare_capacity()?;
+        fs_dir.capacity_check_move(src, dst)?;
         let src_inp = Self::resolve_path(&fs_dir, src)?;
         let dst_inp = Self::resolve_path(&fs_dir, dst)?;
 
@@ -314,11 +460,14 @@ impl MasterFilesystem {
             }
         }
 
+        let capacity_blocks = fs_dir.capacity_subtree_blocks(&dst_inp);
         if let Some(del_res) = fs_dir.rename(&src_inp, &dst_inp, flags)? {
+            fs_dir.capacity_deleting(&del_res)?;
             let mut worker_manager = self.worker_manager.write();
             worker_manager.remove_blocks(&del_res);
         }
 
+        fs_dir.capacity_retire_missing(&capacity_blocks)?;
         Ok(true)
     }
 
@@ -328,7 +477,11 @@ impl MasterFilesystem {
     }
 
     fn truncate(&self, fs_dir: &mut FsDir, inp: &InodePath, opts: CreateFileOpts) -> FsResult<()> {
+        fs_dir.prepare_capacity()?;
+        let capacity_blocks = fs_dir.capacity_subtree_blocks(inp);
         let clean_result = fs_dir.overwrite_file(inp, opts)?;
+        fs_dir.capacity_deleting(&clean_result)?;
+        fs_dir.capacity_retire_missing(&capacity_blocks)?;
         if !clean_result.blocks.is_empty() {
             let mut worker_manager = self.worker_manager.write();
             worker_manager.remove_blocks(&clean_result);
@@ -369,7 +522,12 @@ impl MasterFilesystem {
         }
 
         let mut fs_dir = self.fs_dir.write();
+        fs_dir.prepare_capacity()?;
         let inp = Self::resolve_path(&fs_dir, path)?;
+        crate::master::quota::capacity_manager::CapacityManager::directory(
+            &fs_dir.capacity_conf,
+            inp.path(),
+        )?;
 
         let last_inode = inp.get_last_inode();
         if let Some(inode) = &last_inode {
@@ -421,6 +579,7 @@ impl MasterFilesystem {
         }
 
         let mut fs_dir = self.fs_dir.write();
+        fs_dir.prepare_capacity()?;
         let inp = Self::resolve_path(&fs_dir, path)?;
 
         let inode = match inp.get_last_inode() {
@@ -448,6 +607,8 @@ impl MasterFilesystem {
             return Ok(FileBlocks::new(status, vec![]));
         }
 
+        let updates = fs_dir.capacity_reopen(inode.as_file_ref()?);
+        self.capacity_admit(&mut fs_dir, updates)?;
         let status = fs_dir.reopen_file(&inp, opts.client_name)?;
         let file = inode.as_file_ref()?;
         let blocks = if !file.blocks.is_empty() {
@@ -633,6 +794,7 @@ impl MasterFilesystem {
     ) -> FsResult<LocatedBlock> {
         let path = path.as_ref();
         let mut fs_dir = self.fs_dir.write();
+        fs_dir.prepare_capacity()?;
         let inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
         let file = inode.as_file_ref()?;
 
@@ -653,21 +815,54 @@ impl MasterFilesystem {
         }
 
         let block_size = file.block_size as i64;
+        let new_id = crate::master::meta::InodeId::create_block_id(file.id, file.next_seq as i64)?;
+        let preview = fs_dir.capacity_new_block(file, new_id, &[])?;
+        self.capacity_check_admission(&mut fs_dir, preview)?;
         let choose_workers = self.choose_worker_for_file(file, client_addr, exclude_workers)?;
+        let mut updates = fs_dir.capacity_new_block(file, new_id, &choose_workers)?;
+        if self
+            .worker_manager
+            .read()
+            .workers_have_spdk(&choose_workers)
+        {
+            for update in &mut updates {
+                if let Some(charge) = &mut update.charge {
+                    charge.allocation_floor = block_size as u64;
+                }
+            }
+        }
+        if let Err(e) = self.capacity_admit(&mut fs_dir, updates) {
+            self.worker_manager
+                .write()
+                .unschedule_chosen_workers(&choose_workers, block_size);
+            return Err(e);
+        }
         let has_spdk = {
             let wm = self.worker_manager.read();
             wm.workers_have_spdk(&choose_workers)
         };
-        let block =
-            match fs_dir.acquire_new_block(path, inode, commit_blocks, &choose_workers, file_len) {
-                Ok(block) => block,
-                Err(e) => {
-                    self.worker_manager
-                        .write()
-                        .unschedule_chosen_workers(&choose_workers, block_size);
-                    return Err(e);
+        let block = match fs_dir.acquire_new_block(
+            path,
+            inode,
+            commit_blocks,
+            &choose_workers,
+            file_len,
+        ) {
+            Ok(block) => block,
+            Err(e) => {
+                self.worker_manager
+                    .write()
+                    .unschedule_chosen_workers(&choose_workers, block_size);
+                let still_exists = fs_dir.store.get_inode(crate::master::meta::InodeId::get_id(new_id), None)?
+                        .is_some_and(|v| matches!(v, InodeView::File(f) if f.blocks.iter().any(|b|b.id == new_id)));
+                if !still_exists && fs_dir.capacity_conf.enabled() {
+                    fs_dir.record_capacity(vec![
+                        crate::master::quota::capacity_manager::CapacityUpdate::remove(new_id),
+                    ])?;
                 }
-            };
+                return Err(e);
+            }
+        };
         let located = LocatedBlock {
             block,
             locs: choose_workers,
@@ -737,7 +932,22 @@ impl MasterFilesystem {
     ) -> FsResult<Option<FileBlocks>> {
         let path = path.as_ref();
         let mut fs_dir = self.fs_dir.write();
+        fs_dir.prepare_capacity()?;
         let mut inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
+        if !options.only_flush {
+            fs_dir.capacity_check_replicas(
+                &fs_dir.capacity.inode_blocks(inode.id()),
+                options
+                    .set_attr_opts
+                    .as_ref()
+                    .and_then(|opts| opts.replicas),
+            )?;
+        }
+        let capacity_commits = if fs_dir.capacity_conf.enabled() {
+            commit_blocks.clone()
+        } else {
+            Vec::new()
+        };
         fs_dir.complete_file(
             path,
             &mut inode,
@@ -747,6 +957,8 @@ impl MasterFilesystem {
             options.only_flush,
             options.set_attr_opts,
         )?;
+
+        fs_dir.capacity_complete(inode.as_file_ref()?, &capacity_commits)?;
 
         if options.only_flush && options.return_file_blocks {
             let file = inode.as_file_ref()?;
@@ -1245,6 +1457,7 @@ impl MasterFilesystem {
             );
         }
 
+        let mut capacity_deleted = Vec::new();
         let mut batch: Vec<(bool, i64, BlockLocation)> = vec![];
         let mut wm = self.worker_manager.write();
         for (item, exists) in checked {
@@ -1273,10 +1486,20 @@ impl MasterFilesystem {
                 BlockReportStatus::Deleted => {
                     batch.push((false, item.id, loc));
                     wm.deleted_block(list.worker_id, item.id);
+                    capacity_deleted.push(item.id);
                 }
             }
         }
         drop(wm);
+
+        if !capacity_deleted.is_empty() {
+            let mut fs_dir = self.fs_dir.write();
+            let updates = capacity_deleted
+                .into_iter()
+                .filter_map(|id| fs_dir.capacity.deleted(id, list.worker_id))
+                .collect();
+            fs_dir.record_capacity(updates)?;
+        }
 
         // Keep the block ids of a completing batch so a failure can be retried.
         let retry_blocks = full_reported_blocks.clone();
@@ -1486,7 +1709,8 @@ impl MasterFilesystem {
 
     pub fn delete_locations(&self, worker_id: u32) -> FsResult<LostWorkerLocationCleanup> {
         let removed_block_ids = {
-            let fs_dir = self.fs_dir.write();
+            let mut fs_dir = self.fs_dir.write();
+            fs_dir.prepare_capacity()?;
             fs_dir.delete_locations(worker_id)?
         };
         let mut invalidated = CacheInvalidationResult::default();
@@ -1528,7 +1752,16 @@ impl MasterFilesystem {
 
     pub fn set_attr<T: AsRef<str>>(&self, path: T, opts: SetAttrOpts) -> FsResult<FileStatus> {
         let mut fs_dir = self.fs_dir.write();
+        fs_dir.prepare_capacity()?;
         let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
+        let blocks = if opts.recursive {
+            fs_dir.capacity_subtree_blocks(&inp)
+        } else {
+            inp.get_last_inode()
+                .map(|i| fs_dir.capacity.inode_blocks(i.id()))
+                .unwrap_or_default()
+        };
+        fs_dir.capacity_check_replicas(&blocks, opts.replicas)?;
         fs_dir.set_attr(inp, opts)
     }
 
@@ -1559,6 +1792,8 @@ impl MasterFilesystem {
 
     pub fn link<T: AsRef<str>>(&self, src_path: T, dst_path: T) -> FsResult<()> {
         let mut fs_dir = self.fs_dir.write();
+        fs_dir.prepare_capacity()?;
+        fs_dir.capacity_check_move(src_path.as_ref(), dst_path.as_ref())?;
         let src_path = Self::resolve_path(&fs_dir, src_path.as_ref())?;
         let dst_path = Self::resolve_path(&fs_dir, dst_path.as_ref())?;
         fs_dir.link(src_path, dst_path)
@@ -1588,11 +1823,26 @@ impl MasterFilesystem {
 
         let (del_res, inode_id) = {
             let mut fs_dir = self.fs_dir.write();
+            fs_dir.prepare_capacity()?;
             let mut inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
             let file = inode.as_file_ref()?;
             Self::validate_alloc_capacity(file.len, file.replicas, &opts, available)?;
+            if fs_dir.capacity_conf.enabled() && !opts.truncate {
+                let mut projected = file.clone();
+                projected.resize(opts.clone())?;
+                let mut updates = fs_dir.capacity_reopen(file);
+                for block in &projected.blocks {
+                    if !file.blocks.iter().any(|b| b.id == block.id) {
+                        updates.extend(fs_dir.capacity_new_block(&projected, block.id, &[])?);
+                    }
+                }
+                self.capacity_admit(&mut fs_dir, updates)?;
+            }
             let inode_id = inode.id();
+            let capacity_blocks = fs_dir.capacity.inode_blocks(inode_id);
             let del_res = fs_dir.resize_inode(path, &mut inode, opts)?;
+            fs_dir.capacity_deleting(&del_res)?;
+            fs_dir.capacity_retire_missing(&capacity_blocks)?;
             (del_res, inode_id)
         };
 
@@ -1631,11 +1881,54 @@ impl MasterFilesystem {
     ) -> FsResult<LocatedBlock> {
         let path = path.as_ref();
         let mut fs_dir = self.fs_dir.write();
+        fs_dir.prepare_capacity()?;
         let mut inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
 
         let file = inode.as_file_ref()?;
+        if fs_dir.capacity_conf.enabled() {
+            let existing = file
+                .blocks
+                .iter()
+                .find(|b| b.id == block.id)
+                .ok_or_else(|| FsError::invalid_argument("block does not belong to file"))?;
+            if existing.locs.is_some() || existing.alloc_opts.is_none() {
+                let locations = file.get_locs(&fs_dir.store)?;
+                let locations = locations.get(&block.id).cloned().unwrap_or_default();
+                return self.create_locate_block(
+                    path,
+                    ExtendedBlock {
+                        id: existing.id,
+                        len: existing.len(),
+                        storage_type: file.storage_policy.storage_type,
+                        file_type: file.file_type,
+                        alloc_opts: existing.alloc_opts.clone(),
+                    },
+                    &locations,
+                );
+            }
+            let preview = fs_dir.capacity_new_block(file, block.id, &[])?;
+            self.capacity_check_admission(&mut fs_dir, preview)?;
+        }
         let block_size = file.block_size as i64;
         let choose_workers = self.choose_worker_for_file(file, client_addr, exclude_workers)?;
+        let mut updates = fs_dir.capacity_new_block(file, block.id, &choose_workers)?;
+        if self
+            .worker_manager
+            .read()
+            .workers_have_spdk(&choose_workers)
+        {
+            for update in &mut updates {
+                if let Some(charge) = &mut update.charge {
+                    charge.allocation_floor = block_size as u64;
+                }
+            }
+        }
+        if let Err(e) = self.capacity_admit(&mut fs_dir, updates) {
+            self.worker_manager
+                .write()
+                .unschedule_chosen_workers(&choose_workers, block_size);
+            return Err(e);
+        }
         let has_spdk = {
             let wm = self.worker_manager.read();
             wm.workers_have_spdk(&choose_workers)

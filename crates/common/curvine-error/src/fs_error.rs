@@ -73,6 +73,7 @@ pub enum ErrorKind {
     TransferStoreUnavailable = 34,
     TransferAlreadyRunning = 35,
     TransferTargetConflict = 36,
+    QuotaExceeded = 37,
 
     #[num_enum(default)]
     Common = 10000,
@@ -164,6 +165,9 @@ pub enum FsError {
     // Insufficient disk space.
     #[error("{0}")]
     DiskOutOfSpace(ErrorImpl<StringError>),
+
+    #[error("{0}")]
+    QuotaExceeded(ErrorImpl<StringError>),
 
     #[error("{0}")]
     InProgress(ErrorImpl<StringError>),
@@ -360,6 +364,10 @@ impl FsError {
         Self::InvalidArgument(ErrorImpl::with_source(msg.into().into()))
     }
 
+    pub fn quota_exceeded(msg: impl Into<String>) -> Self {
+        Self::QuotaExceeded(ErrorImpl::with_source(msg.into().into()))
+    }
+
     pub fn disk_out_of_space(msg: impl Into<String>) -> Self {
         Self::DiskOutOfSpace(ErrorImpl::with_source(msg.into().into()))
     }
@@ -441,6 +449,7 @@ impl FsError {
             FsError::InvalidPath(_) => ErrorKind::InvalidPath,
             FsError::InvalidArgument(_) => ErrorKind::InvalidArgument,
             FsError::DiskOutOfSpace(_) => ErrorKind::DiskOutOfSpace,
+            FsError::QuotaExceeded(_) => ErrorKind::QuotaExceeded,
             FsError::InProgress(_) => ErrorKind::InProgress,
             FsError::Unsupported(_) => ErrorKind::Unsupported,
             FsError::Ufs(_) => ErrorKind::Ufs,
@@ -589,6 +598,7 @@ impl ErrorExt for FsError {
             FsError::InvalidPath(e) => FsError::InvalidPath(e.ctx(ctx)),
             FsError::InvalidArgument(e) => FsError::InvalidArgument(e.ctx(ctx)),
             FsError::DiskOutOfSpace(e) => FsError::DiskOutOfSpace(e.ctx(ctx)),
+            FsError::QuotaExceeded(e) => FsError::QuotaExceeded(e.ctx(ctx)),
             FsError::InProgress(e) => FsError::InProgress(e.ctx(ctx)),
             FsError::Unsupported(e) => FsError::Unsupported(e.ctx(ctx)),
             FsError::Ufs(e) => FsError::Ufs(e.ctx(ctx)),
@@ -631,6 +641,7 @@ impl ErrorExt for FsError {
             FsError::InvalidPath(e) => e.encode(ErrorKind::InvalidPath),
             FsError::InvalidArgument(e) => e.encode(ErrorKind::InvalidArgument),
             FsError::DiskOutOfSpace(e) => e.encode(ErrorKind::DiskOutOfSpace),
+            FsError::QuotaExceeded(e) => e.encode(ErrorKind::QuotaExceeded),
             FsError::InProgress(e) => e.encode(ErrorKind::InProgress),
             FsError::Unsupported(e) => e.encode(ErrorKind::Unsupported),
             FsError::Ufs(e) => e.encode(ErrorKind::Ufs),
@@ -676,6 +687,7 @@ impl ErrorExt for FsError {
             ErrorKind::InvalidPath => FsError::InvalidPath(de.into_string()),
             ErrorKind::InvalidArgument => FsError::InvalidArgument(de.into_string()),
             ErrorKind::DiskOutOfSpace => FsError::DiskOutOfSpace(de.into_string()),
+            ErrorKind::QuotaExceeded => FsError::QuotaExceeded(de.into_string()),
             ErrorKind::InProgress => FsError::InProgress(de.into_string()),
             ErrorKind::Unsupported => FsError::Unsupported(de.into_string()),
             ErrorKind::Ufs => FsError::Ufs(de.into_string()),
@@ -707,6 +719,16 @@ mod tests {
     use super::ErrorKind;
     use crate::FsError;
     use curvine_core_error::{ErrorExt, ErrorImpl};
+
+    #[test]
+    fn quota_exceeded_round_trip_test() {
+        let error = FsError::quota_exceeded("/checkpoints: limit reached");
+        assert!(matches!(error.kind(), ErrorKind::QuotaExceeded));
+        let decoded = FsError::decode(error.encode());
+        assert!(matches!(decoded, FsError::QuotaExceeded(_)));
+        assert!(decoded.to_string().contains("/checkpoints"));
+        assert!(!decoded.should_retry());
+    }
 
     #[test]
     pub fn error_test() {

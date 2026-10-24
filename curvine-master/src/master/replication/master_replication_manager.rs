@@ -487,6 +487,8 @@ impl MasterReplicationManager {
             block_id, block_state.locations, target.address
         );
 
+        self.fs
+            .reserve_replica_capacity(block_id, target.address.worker_id)?;
         let submit_deadline = Instant::now() + self.submit_timeout;
         let source_addr = target_duration(submit_deadline)?;
         let source_worker_addr = source.address.inet_addr();

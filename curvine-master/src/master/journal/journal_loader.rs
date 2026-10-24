@@ -302,7 +302,9 @@ impl JournalLoader {
                     continue;
                 }
 
-                JournalEntry::CacheInvalidation(_) | JournalEntry::UfsApplied(_) => (),
+                JournalEntry::CacheInvalidation(_)
+                | JournalEntry::UfsApplied(_)
+                | JournalEntry::Capacity(_) => (),
 
                 _ => has_ufs_affecting = true,
             }
@@ -661,6 +663,10 @@ impl JournalLoader {
             JournalEntry::Free(e) => self.free(e),
 
             JournalEntry::CacheInvalidation(e) => self.cache_invalidation(e),
+            JournalEntry::Capacity(e) => {
+                self.fs_dir.write().apply_capacity(&e.updates)?;
+                Ok(())
+            }
 
             JournalEntry::ReopenFile(e) => self.reopen_file(e),
 
